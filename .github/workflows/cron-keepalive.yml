@@ -1,0 +1,31 @@
+name: Keepalive Supabase
+
+on:
+  schedule:
+    # Tous les 5 jours à 03h00 UTC (06h00 heure Madagascar)
+    # Supabase free tier se met en veille après 7 jours d'inactivité
+    - cron: '0 3 */5 * *'
+  # Déclenchement manuel depuis GitHub → Actions → Run workflow
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: 🏓 Ping Supabase keepalive
+        run: |
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.ERP_BASE_URL }}/api/ping")
+
+          echo "HTTP status: $RESPONSE"
+          cat response.json
+
+          if [ "$RESPONSE" != "200" ]; then
+            echo "❌ Ping échoué — statut $RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ Supabase réveillé avec succès"
