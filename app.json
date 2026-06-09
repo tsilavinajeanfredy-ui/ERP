@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "ERP GSI",
+    "slug": "erp-gsi",
+    "scheme": "erp-gsi",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./public/photos/logo.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "00000000-0000-0000-0000-000000000000"
+      }
+    },
+    "plugins": [
+      "expo-asset",
+      "expo-font"
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+name: Déploiement ERP GSI (Staging / Production)
+
+on:
+  push:
+    branches:
+      - main # Déclencheur sur chaque merge sur la branche principale
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Clonage du dépôt
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Configuration de Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 🚀 Installation des dépendances
+        run: npm ci
+
+      - name: 🏗️ Build de l'application Expo Web
+        run: npm run build:web
+        env:
+          # Les clés Supabase de production doivent être ajoutées dans les "Secrets" du repo GitHub
+          EXPO_PUBLIC_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          EXPO_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+
+      - name: 📤 Déploiement vers le VPS Hetzner via SSH (rsync)
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "dist/*"
+          target: "/var/www/erp-gsi/web-dist"
+          strip_components: 1
+
+      - name: 🔔 Notification Slack (#erp-ops)
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: always()
