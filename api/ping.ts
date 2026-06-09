@@ -1,8 +1,6 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { createClient } from '@supabase/supabase-js'
+const { createClient } = require('@supabase/supabase-js')
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Bloquer si un secret est configuré et qu'il ne correspond pas
+module.exports = async function handler(req: any, res: any) {
   const secret = process.env.CRON_SECRET
   if (secret && req.headers['x-cron-secret'] !== secret) {
     return res.status(401).send('Unauthorized')
@@ -14,7 +12,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       process.env.SUPABASE_SERVICE_ROLE_KEY!
     )
 
-    // Simple requête légère pour réveiller Supabase
     await supabase.from('articles').select('id').limit(1)
 
     res.status(200).json({ ok: true, ts: new Date().toISOString() })
