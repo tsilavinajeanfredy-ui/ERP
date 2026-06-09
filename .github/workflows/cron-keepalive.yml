@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: 🏓 Ping Supabase keepalive
         run: |
-          RESPONSE=$(curl -s -o response.json -w "%{http_code}" \
+          RESPONSE=$(curl -s -L -o response.json -w "%{http_code}" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
             "${{ secrets.ERP_BASE_URL }}/api/ping")
 
