@@ -4,6 +4,10 @@ const config = getDefaultConfig(__dirname);
 
 config.resolver.assetExts.push('webp');
 
+// FIX EMFILE — Limiter les workers pour éviter "too many open files" sur Windows
+// Metro ouvre trop de fichiers en parallèle quand plusieurs lazy screens se bundlent simultanément
+config.maxWorkers = 2;
+
 // Exclure les fichiers zip du watcher (évite l'erreur EBUSY sur Windows)
 config.watchFolders = [];
 config.resolver.blockList = [

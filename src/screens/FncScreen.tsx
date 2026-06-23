@@ -3,9 +3,11 @@ import { ScrollView, StyleSheet, Text, View, ActivityIndicator, TouchableOpacity
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { C, KpiCard, ActionButton, Badge, AnimatedPage, FormModal, FormInput, FormSelect, SectionTitle, DataTable, StepperRow, Divider, ExportOverlay, PaginationControls } from '../components/Ui';
 import { useFnc, useLots, useUsers, useUserProfile, useMutation, usePermissions, useNotification, useRecordAuditLogs, confirmAction } from '../lib/hooks';
+import { supabase } from '../lib/supabase';
+import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from '../lib/i18n';
 import { useSearch } from '../lib/search';
-import { Fnc } from '../lib/database.types';
+import { Fnc, FncDecisionType } from '../lib/database.types';
 import { generatePdf, getPdfTemplate } from '../lib/pdf';
 
 // Import platform-specific : Metro charge automatiquement
@@ -33,8 +35,28 @@ const FIELD_LABELS: Record<string, string> = {
     'd8_closure_notes': 'D8: Clôture',
     'd8_signature': 'Signature Finale',
     'status': 'Statut Global',
-    'assigned_to': 'Assignation'
+    'assigned_to': 'Assignation',
+    'decision_type': 'Décision Qualité',
+    'decision_notes': 'Note de Décision',
+    'decision_at': 'Date de Décision',
+    'efficacy_checked': 'Efficacité Vérifiée',
+    'efficacy_notes': 'Note Efficacité',
+    'closed_at': 'Date de Clôture',
+    'closed_by': 'Clôturé par',
+    'severity': 'Sévérité',
+    'root_cause': 'Cause Racine',
+    'corrective_action': 'Action Corrective',
 };
+
+/** Décisions qualité typées + workflow (rôle notifié) */
+const FNC_DECISION_MAP: Record<FncDecisionType, { label: string; color: string; notifyRole: 'RQ' | 'MAGA' | 'RACH' | 'RPROD'; workflow: string; releaseLot: boolean }> = {
+    BLOQUE:    { label: 'Bloqué (maintien blocage)', color: C.err,  notifyRole: 'RQ',    workflow: 'Lot maintenu bloqué', releaseLot: false },
+    DETERIORE: { label: 'Détérioré (rebut)',         color: C.err,  notifyRole: 'MAGA',  workflow: 'Mise au rebut', releaseLot: false },
+    RETOUR:    { label: 'Retour fournisseur',        color: C.gold, notifyRole: 'RACH',  workflow: 'Alerte achat — retour fournisseur', releaseLot: false },
+    TRI:       { label: 'Tri (sous-OF de tri)',      color: C.info, notifyRole: 'RPROD', workflow: 'Sous-OF de tri à créer', releaseLot: true },
+    REWORK:    { label: 'Reprise (OF de correction)', color: C.info, notifyRole: 'RPROD', workflow: 'OF de correction à créer', releaseLot: true },
+};
+const FNC_DECISION_OPTIONS = (Object.keys(FNC_DECISION_MAP) as FncDecisionType[]).map(k => ({ label: FNC_DECISION_MAP[k].label, value: k }));
 
 const FNC_SEVERITY_MAP: Record<string, { label: string; color: string }> = {
     CRITIQUE: { label: 'Critique', color: C.err },
@@ -63,6 +85,7 @@ export function FncScreen() {
   const { data: fncs = [], count: fncsCount, isPending: loadingFncs } = useFnc(page, limit); // Fetch FNCs
     const { data: lots = [] } = useLots(0, 100); // To select associated lot
     const { profile } = useUserProfile();
+    const queryClient = useQueryClient();
 
     const { canPerformAction, role } = usePermissions();
     const { searchQuery } = useSearch();
@@ -73,6 +96,10 @@ export function FncScreen() {
     const [isGeneratingPdf, setIsGeneratingPdf] = React.useState(false);
     const [signature, setSignature] = React.useState<string | null>(null); // Base64 string of the signature
     const [isSigModalVisible, setIsSigModalVisible] = React.useState(false);
+    const [decisionType, setDecisionType] = React.useState<FncDecisionType | ''>('');
+    const [decisionNotes, setDecisionNotes] = React.useState('');
+    const [efficacyChecked, setEfficacyChecked] = React.useState(false);
+    const [efficacyNotes, setEfficacyNotes] = React.useState('');
     const notify = useNotification(); // Use the renamed hook
 
     const [selId, setSelId] = React.useState<string | null>(null);
@@ -109,6 +136,20 @@ export function FncScreen() {
         setPage(0);
     }, [searchQuery]);
 
+    // FIX — useEffect déplacé AVANT le early return pour éviter "Rendered more hooks than during previous render"
+    // React exige le même nombre de hooks à chaque render — jamais après un return conditionnel
+    React.useEffect(() => {
+        if (selectedFnc) {
+            const fieldMap: Record<number, any> = { 0: selectedFnc.d1_team, 1: selectedFnc.description, 2: selectedFnc.d3_containment, 3: selectedFnc.d4_root_cause, 4: selectedFnc.d5_planned_actions, 5: selectedFnc.d6_implemented_actions, 6: selectedFnc.d7_preventive_actions, 7: selectedFnc.d8_closure_notes };
+            setDContent(fieldMap[activeDStep] || '');
+            setSignature(selectedFnc.d8_signature || null);
+            setDecisionType((selectedFnc.decision_type as FncDecisionType) || '');
+            setDecisionNotes(selectedFnc.decision_notes || '');
+            setEfficacyChecked(selectedFnc.efficacy_checked === true);
+            setEfficacyNotes(selectedFnc.efficacy_notes || '');
+        }
+    }, [activeDStep, selectedFnc]);
+
     if (loadingFncs) {
         return (
             <View style={[s.container, { justifyContent: 'center', alignItems: 'center' }]}>
@@ -128,7 +169,9 @@ export function FncScreen() {
 
     const handleAddFnc = () => {
         const year = new Date().getFullYear();
-        const count = fncs.length + 1;
+        // FIX 2 — utiliser fncsCount (total BDD) plutôt que fncs.length (page courante)
+        // pour éviter les collisions de codes quand la pagination est active
+        const count = (fncsCount || fncs.length) + 1;
         const generatedCode = `FNC-${year}-${count.toString().padStart(4, '0')}`;
 
         setIsEditing(false);
@@ -144,7 +187,12 @@ export function FncScreen() {
 
     const handleSaveFnc = () => {
         if (!formData.code || !formData.lot_id || !formData.description) {
-            Alert.alert("Champs manquants", "Veuillez renseigner le code, le lot et la description.");
+            confirmAction(
+                'Champs manquants',
+                'Veuillez renseigner le code, le lot et la description.',
+                () => {},
+                { variant: 'warning', confirmLabel: 'Compris', cancelLabel: '' }
+            );
             return;
         }
         if (isEditing && formData.id) {
@@ -180,13 +228,128 @@ export function FncScreen() {
         );
     };
 
-    const handleCloseFnc = (fncId: string) => {
+    const handleCloseFnc = async (fncId: string) => {
+        const fnc = fncs.find((f: Fnc) => f.id === fncId);
+
+        // FIX 4 — Gates de clôture via confirmAction (compatible web/Vercel) au lieu de Alert.alert natif
+        if (!efficacyChecked) {
+            confirmAction(
+                'Vérification d\'efficacité requise',
+                'Vous devez valider la vérification d\'efficacité des actions correctives (D6) avant de clôturer la FNC.',
+                () => {},
+                { variant: 'warning', confirmLabel: 'Compris', cancelLabel: '' }
+            );
+            return;
+        }
+        if (!decisionType) {
+            confirmAction(
+                'Décision qualité requise',
+                'Sélectionnez une décision qualité (Bloqué, Détérioré, Retour, Tri ou Reprise) avant de clôturer.',
+                () => {},
+                { variant: 'warning', confirmLabel: 'Compris', cancelLabel: '' }
+            );
+            return;
+        }
+
+        const decisionMeta = FNC_DECISION_MAP[decisionType];
+
+        // 1. Clôturer la FNC + enregistrer la décision et la vérification d'efficacité
         mutation.mutate({
             id: fncId,
-            values: { status: 'CLOTUREE', closed_at: new Date().toISOString(), closed_by: profile?.full_name || 'Système' },
+            values: {
+                status: 'CLOTUREE',
+                closed_at: new Date().toISOString(),
+                closed_by: profile?.full_name || 'Système',
+                decision_type: decisionType,
+                decision_notes: decisionNotes || null,
+                decision_at: new Date().toISOString(),
+                decision_by: profile?.id || null,
+                efficacy_checked: true,
+                efficacy_notes: efficacyNotes || null,
+                efficacy_checked_at: new Date().toISOString(),
+                efficacy_checked_by: profile?.id || null,
+            },
             type: 'UPDATE'
         });
-        setSelId(null); // Close detail view after action
+
+        // 1b. Workflow associé à la décision : notifier le rôle concerné
+        if (supabase) {
+            try {
+                await supabase.from('notifications').insert({
+                    role: decisionMeta.notifyRole,
+                    title: `[FNC ${fnc?.code}] Décision : ${decisionMeta.label}`,
+                    message: `FNC ${fnc?.code} (lot ${fnc?.lot_code || '—'}, ${fnc?.article_name || ''}) clôturée.\nDécision : ${decisionMeta.label}.\nAction attendue : ${decisionMeta.workflow}.${decisionNotes ? '\nNote : ' + decisionNotes : ''}`,
+                    type: 'warning',
+                    metadata: { category: 'QUALITY', screen: 'Fnc', fnc_id: fncId, lot_id: fnc?.lot_id, decision_type: decisionType },
+                });
+            } catch (err) {
+                console.warn('[FNC] Notification de décision échouée :', err);
+            }
+        }
+
+        // 2. Libération du lot en stock UNIQUEMENT si la décision le permet (TRI / REWORK)
+        if (decisionMeta.releaseLot && fnc?.lot_id && supabase) {
+            try {
+                // Récupérer le lot complet (qty, depot, article)
+                const { data: lot } = await supabase
+                    .from('lots')
+                    .select('id, code, qty_current, qty_received, unit, depot_id, article_id, cqlib_status')
+                    .eq('id', fnc.lot_id)
+                    .maybeSingle();
+
+                if (lot && lot.cqlib_status === 'BLOQUE') {
+                    const qty = parseFloat(String(lot.qty_current ?? lot.qty_received ?? 0));
+                    const articleId = lot.article_id;
+                    const depotId   = lot.depot_id;
+                    const unit      = lot.unit || 'kg';
+
+                    // 2a. Passer le lot de BLOQUÉ → LIBÉRÉ
+                    await supabase
+                        .from('lots')
+                        .update({ cqlib_status: 'LIBERE' })
+                        .eq('id', fnc.lot_id);
+
+                    // 2b. Créer le mouvement d'entrée en stock
+                    if (articleId && qty > 0) {
+                        const { error: mvtErr } = await supabase
+                            .from('stock_movements')
+                            .insert({
+                                lot_id:        fnc.lot_id,
+                                article_id:    articleId,
+                                depot_to_id:   depotId,
+                                movement_type: 'ENTREE',
+                                qty,
+                                unit,
+                                reference_doc: fnc.code,
+                                notes: `Résolution FNC ${fnc.code} — lot ${lot.code} libéré après action corrective, intégré en stock.`,
+                                performed_by:  profile?.id || null,
+                            });
+
+                        if (!mvtErr) {
+                            queryClient.invalidateQueries({ queryKey: ['lots'] });
+                            queryClient.invalidateQueries({ queryKey: ['stock_movements'] });
+                            queryClient.invalidateQueries({ queryKey: ['stock_movements_full'] });
+                            queryClient.invalidateQueries({ queryKey: ['stock_card'] });
+
+                            // Notifier MAGA et PLAN
+                            for (const r of ['MAGA', 'PLAN'] as const) {
+                                await supabase.from('notifications').insert({
+                                    role: r,
+                                    title: `[STOCK] Lot ${lot.code} libéré après résolution NC`,
+                                    message: `Lot ${lot.code} (${fnc.article_name || ''}) précédemment bloqué — FNC ${fnc.code} clôturée.\nQuantité disponible en stock : ${qty} ${unit}.`,
+                                    type: 'success',
+                                    metadata: { category: 'STOCK', screen: 'StocksScreen', lot_id: fnc.lot_id, fnc_id: fncId },
+                                });
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.warn('[FNC] Libération lot post-clôture échouée :', err);
+            }
+        }
+
+        setSelId(null);
     };
 
     const handleSaveDStep = async () => {
@@ -226,49 +389,42 @@ export function FncScreen() {
                         message: `Le rapport 8D pour la FNC ${selectedFnc?.code} concernant le lot ${selectedFnc?.lot_code} (${selectedFnc?.article_name}) a été complété techniquement et attend votre validation finale.`,
                         metadata: { fnc_id: selectedFnc?.id },
                         type: 'internal',
-                        category: 'QUALITY', // Catégorie métier pour le filtrage
+                        category: 'QUALITY',
                     });
 
-                    // NEW: Notification push pour la Direction (DPI)
+                    // Notification push pour la Direction (DPI)
                     notify.mutate({
                         to_role: 'DPI',
                         subject: `FNC ${selectedFnc?.code} en attente d'approbation`,
                         message: `Une FNC (${selectedFnc?.code}) est prête pour votre approbation finale.`,
                         metadata: { fnc_id: selectedFnc?.id },
-                        type: 'internal', // Notification interne également
+                        type: 'internal',
                     });
                 }
 
                 if (activeDStep < 7) setActiveDStep(activeDStep + 1);
+            },
+            // FIX 1 — isSavingD remis à false même en cas d'erreur
+            onError: () => {
+                setIsSavingD(false);
             }
         });
     };
 
-    React.useEffect(() => {
-        if (selectedFnc) {
-            const fieldMap: Record<number, any> = { 0: selectedFnc.d1_team, 1: selectedFnc.description, 2: selectedFnc.d3_containment, 3: selectedFnc.d4_root_cause, 4: selectedFnc.d5_planned_actions, 5: selectedFnc.d6_implemented_actions, 6: selectedFnc.d7_preventive_actions, 7: selectedFnc.d8_closure_notes };
-            setDContent(fieldMap[activeDStep] || '');
-            setSignature(selectedFnc.d8_signature || null);
-        }
-    }, [activeDStep, selectedFnc]);
 
     const handleReopenFnc = (fncId: string) => {
-        Alert.alert(
-            "Réouverture FNC",
-            "Êtes-vous sûr de vouloir réouvrir cette FNC ? Les verrous de saisie seront levés.",
-            [
-                { text: "Annuler", style: "cancel" },
-                {
-                    text: "Réouvrir",
-                    onPress: () => {
-                        mutation.mutate({
-                            id: fncId,
-                            values: { status: 'EN_COURS', closed_at: null, closed_by: null },
-                            type: 'UPDATE'
-                        });
-                    }
-                }
-            ]
+        // FIX 2 (Fix 2 session précédente) — confirmAction compatible web
+        confirmAction(
+            'Réouverture FNC',
+            'Êtes-vous sûr de vouloir réouvrir cette FNC ? Les verrous de saisie seront levés.',
+            () => {
+                mutation.mutate({
+                    id: fncId,
+                    values: { status: 'EN_COURS', closed_at: null, closed_by: null },
+                    type: 'UPDATE'
+                });
+            },
+            { variant: 'warning' }
         );
     };
 
@@ -279,7 +435,12 @@ export function FncScreen() {
 
     const handleConfirmAssign = () => {
         if (!selectedFnc || !assignUserId) {
-            Alert.alert('Champ requis', 'Veuillez sélectionner un responsable.');
+            confirmAction(
+                'Champ requis',
+                'Veuillez sélectionner un responsable.',
+                () => {},
+                { variant: 'warning', confirmLabel: 'Compris', cancelLabel: '' }
+            );
             return;
         }
         const assignedUser = users.find((u: any) => u.id === assignUserId);
@@ -334,17 +495,17 @@ export function FncScreen() {
                 `RAPPORT D'ANALYSE 8D - ${selectedFnc.code}`,
                 `
                 <div class="summary-card">
-                  <strong>ARTICLE :</strong> ${selectedFnc.article_name || 'N/A'}<br />
-                  <strong>N° LOT :</strong> ${selectedFnc.lot_code || 'N/A'}<br />
-                  <strong>SÉVÉRITÉ :</strong> ${selectedFnc.severity || 'N/A'}<br />
+                  <strong>ARTICLE :</strong> ${selectedFnc.article_name || '<em style="color:#999;">—</em>'}<br />
+                  <strong>N° LOT :</strong> ${selectedFnc.lot_code || '<em style="color:#999;">—</em>'}<br />
+                  <strong>SÉVÉRITÉ :</strong> ${selectedFnc.severity || '<em style="color:#999;">—</em>'}<br />
                   <strong>DATE OUVERTURE :</strong> ${new Date(selectedFnc.created_at).toLocaleDateString('fr-FR')}<br />
-                  <strong>STATUT ACTUEL :</strong> ${selectedFnc.status || 'N/A'}<br />
-                  <strong>RESPONSABLE :</strong> ${selectedFnc.assigned_to || 'N/A'}
+                  <strong>STATUT ACTUEL :</strong> ${selectedFnc.status || '<em style="color:#999;">—</em>'}<br />
+                  <strong>RESPONSABLE :</strong> ${selectedFnc.assigned_to || '<em style="color:#999;">—</em>'}
                 </div>
 
                 <div style="margin-bottom: 20px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D1 : CONSTITUTION DE L'ÉQUIPE</h3>
-                  <p>${selectedFnc.d1_team || 'Information non renseignée'}</p>
+                  <p>${selectedFnc.d1_team || '<em style="color:#999;">Non renseigné</em>'}</p>
                 </div>
                 
                 <div style="margin-bottom: 20px;">
@@ -354,32 +515,32 @@ export function FncScreen() {
 
                 <div style="margin-bottom: 20px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D3 : ACTIONS DE CONFINEMENT (IMMÉDIATES)</h3>
-                  <p>${selectedFnc.d3_containment || 'N/A'}</p>
+                  <p>${selectedFnc.d3_containment || '<em style="color:#999;">Non renseigné</em>'}</p>
                 </div>
 
                 <div style="margin-bottom: 20px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D4 : ANALYSE DES CAUSES RACINES</h3>
-                  <p>${selectedFnc.d4_root_cause || 'N/A'}</p>
+                  <p>${selectedFnc.d4_root_cause || '<em style="color:#999;">Non renseigné</em>'}</p>
                 </div>
 
                 <div style="margin-bottom: 20px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D5 : ACTIONS CORRECTIVES PLANIFIÉES</h3>
-                  <p>${selectedFnc.d5_planned_actions || 'N/A'}</p>
+                  <p>${selectedFnc.d5_planned_actions || '<em style="color:#999;">Non renseigné</em>'}</p>
                 </div>
 
                 <div style="margin-bottom: 20px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D6 : ACTIONS IMPLÉMENTÉES ET VÉRIFIÉES</h3>
-                  <p>${selectedFnc.d6_implemented_actions || 'N/A'}</p>
+                  <p>${selectedFnc.d6_implemented_actions || '<em style="color:#999;">Non renseigné</em>'}</p>
                 </div>
 
                 <div style="margin-bottom: 20px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D7 : ACTIONS PRÉVENTIVES (ÉVITER LA RÉCIDIVE)</h3>
-                  <p>${selectedFnc.d7_preventive_actions || 'N/A'}</p>
+                  <p>${selectedFnc.d7_preventive_actions || '<em style="color:#999;">Non renseigné</em>'}</p>
                 </div>
 
                 <div style="margin-bottom: 40px;">
                   <h3 style="border-bottom: 1px solid #E9ECEF; padding-bottom: 5px;">D8 : CLÔTURE ET COMMENTAIRES FINAUX</h3>
-                  <p>${selectedFnc.d8_closure_notes || 'Analyse en cours...'}</p>
+                  <p>${selectedFnc.d8_closure_notes || '<em style="color:#999;">Analyse en cours</em>'}</p>
                 </div>
 
                 <table style="width: 100%; border: none;">
@@ -396,7 +557,12 @@ export function FncScreen() {
             await generatePdf(htmlContent, `Rapport_8D_${selectedFnc.code}.pdf`);
         } catch (error) {
             console.error(error);
-            Alert.alert('Erreur', 'La génération du PDF a échoué.');
+            confirmAction(
+                'Erreur PDF',
+                'La génération du PDF a échoué. Vérifiez votre connexion et réessayez.',
+                () => {},
+                { variant: 'danger', confirmLabel: 'Fermer', cancelLabel: '' }
+            );
         } finally {
             setIsGeneratingPdf(false);
         }
@@ -404,7 +570,10 @@ export function FncScreen() {
 
     const openFncs = fncs.filter(f => f.status === 'OUVERTE').length;
     const inProgressFncs = fncs.filter(f => f.status === 'EN_COURS' || f.status === 'A_VALIDER').length;
-    const closedFncs = fncs.filter(f => f.status === 'CLOTUREE').length;
+    // FIX 5 — Filtrer les FNC clôturées sur le mois courant (cohérence avec le libellé "Ce mois")
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const closedFncs = fncs.filter(f => f.status === 'CLOTUREE' && f.closed_at && f.closed_at >= startOfMonth).length;
 
     return (
         <AnimatedPage>
@@ -497,166 +666,234 @@ export function FncScreen() {
                 </View>
             </ScrollView>
 
-            {/* Detail Modal for FNC */}
-            <FormModal
+            {/* Detail Modal for FNC
+                FIX: Remplace FormModal par Modal natif + ScrollView avec keyboardShouldPersistTaps="handled"
+                pour corriger le bug RN Web où TextInput à l'intérieur d'un Modal+ScrollView
+                ne reçoit pas les événements clavier/pointer (saisie impossible). */}
+            <Modal
                 visible={!!selectedFnc}
-                title={`Détails FNC ${selectedFnc?.code || ''}`}
-                onClose={() => setSelId(null)}
-                onSave={() => setSelId(null)} // No direct save for details, just close
-                hideSaveButton={true} // Hide the save button for detail view
+                animationType="fade"
+                transparent
+                onRequestClose={() => setSelId(null)}
             >
-                {selectedFnc && (
-                    <View>
-                        <View style={s.detailSection}>
-                            <SectionTitle>INFORMATIONS GÉNÉRALES</SectionTitle>
-                            <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_code')}:</Text><Text style={s.detailValue}>{selectedFnc.code}</Text></View>
-                            <View style={s.detailRow}><Text style={s.detailLabel}>{t('status')}:</Text><Badge label={FNC_STATUS_MAP[selectedFnc.status]?.label || selectedFnc.status} color={FNC_STATUS_MAP[selectedFnc.status]?.color || C.textMuted} /></View>
-                            {selectedFnc.supplier_name && <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_supplier')}:</Text><Text style={s.detailValue}>{selectedFnc.supplier_name}</Text></View>}
-                            <View style={s.detailRow}><Text style={s.detailLabel}>{t('severity')}:</Text><Badge label={FNC_SEVERITY_MAP[selectedFnc.severity]?.label || selectedFnc.severity} color={FNC_SEVERITY_MAP[selectedFnc.severity]?.color || C.textMuted} /></View>
-                            <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_date_created')}:</Text><Text style={s.detailValue}>{new Date(selectedFnc.created_at).toLocaleDateString()}</Text></View>
-                            <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_created_by')}:</Text><Text style={s.detailValue}>{selectedFnc.created_by || 'Système'}</Text></View>
-                            {selectedFnc.assigned_to && <View style={s.detailRow}><Text style={s.detailLabel}>{t('assigned_to')}:</Text><Text style={s.detailValue}>{selectedFnc.assigned_to}</Text></View>}
-                            {selectedFnc.closed_at && <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_closed_at')}:</Text><Text style={s.detailValue}>{new Date(selectedFnc.closed_at).toLocaleDateString()}</Text></View>}
+                <View style={s.detailModalOverlay}>
+                    <View style={s.detailModalBox}>
+                        {/* Header du modal */}
+                        <View style={s.detailModalHeader}>
+                            <Text style={s.detailModalTitle}>Détails FNC {selectedFnc?.code || ''}</Text>
+                            <TouchableOpacity onPress={() => setSelId(null)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                                <MaterialCommunityIcons name="close" size={24} color="#6C757D" />
+                            </TouchableOpacity>
                         </View>
 
-                        <Divider />
+                        {/* Contenu scrollable — keyboardShouldPersistTaps="handled" est le correctif clé */}
+                        <ScrollView
+                            keyboardShouldPersistTaps="handled"
+                            contentContainerStyle={{ padding: 20 }}
+                            showsVerticalScrollIndicator={true}
+                        >
+                            {selectedFnc && (
+                                <View>
+                                    <View style={s.detailSection}>
+                                        <SectionTitle>INFORMATIONS GÉNÉRALES</SectionTitle>
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_code')}:</Text><Text style={s.detailValue}>{selectedFnc.code}</Text></View>
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>{t('status')}:</Text><Badge label={FNC_STATUS_MAP[selectedFnc.status]?.label || selectedFnc.status} color={FNC_STATUS_MAP[selectedFnc.status]?.color || C.textMuted} /></View>
+                                        {selectedFnc.supplier_name && <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_supplier')}:</Text><Text style={s.detailValue}>{selectedFnc.supplier_name}</Text></View>}
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>{t('severity')}:</Text><Badge label={FNC_SEVERITY_MAP[selectedFnc.severity]?.label || selectedFnc.severity} color={FNC_SEVERITY_MAP[selectedFnc.severity]?.color || C.textMuted} /></View>
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_date_created')}:</Text><Text style={s.detailValue}>{new Date(selectedFnc.created_at).toLocaleDateString()}</Text></View>
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_created_by')}:</Text><Text style={s.detailValue}>{selectedFnc.created_by || 'Système'}</Text></View>
+                                        {selectedFnc.assigned_to && <View style={s.detailRow}><Text style={s.detailLabel}>{t('assigned_to')}:</Text><Text style={s.detailValue}>{selectedFnc.assigned_to}</Text></View>}
+                                        {selectedFnc.closed_at && <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_closed_at')}:</Text><Text style={s.detailValue}>{new Date(selectedFnc.closed_at).toLocaleDateString()}</Text></View>}
+                                    </View>
 
-                        <View style={s.detailSection}>
-                            <SectionTitle>RAPPORT DE RÉSOLUTION 8D</SectionTitle>
-                            <View style={{ marginVertical: 16 }}>
-                                <StepperRow steps={STEPS_8D} current={activeDStep} />
-                            </View>
+                                    <Divider />
 
-                            <View style={s.dStepContainer}>
-                                <Text style={s.dStepTitle}>{STEPS_8D[activeDStep]}</Text>
-                                <TextInput
-                                    style={[s.dStepInput, (selectedFnc.status === 'CLOTUREE' || !canPerformAction('create_fnc')) && s.dStepInputLocked]}
-                                    multiline
-                                    value={dContent ?? ''}
-                                    onChangeText={setDContent}
-                                    placeholder={selectedFnc.status === 'CLOTUREE' ? '' : !canPerformAction('create_fnc') ? 'Lecture seule' : `Saisir les informations pour ${STEPS_8D[activeDStep]}...`}
-                                    editable={selectedFnc.status !== 'CLOTUREE' && canPerformAction('create_fnc')}
-                                />
-                                {activeDStep === 7 && (
-                                    <View style={{ marginTop: 16 }}>
-                                        <Text style={s.dStepTitle}>SIGNATURE ÉLECTRONIQUE</Text>
-                                        <TouchableOpacity
-                                            style={s.signatureBox}
-                                            onPress={() => setIsSigModalVisible(true)}
-                                            disabled={selectedFnc.status === 'CLOTUREE' || !canPerformAction('create_fnc')}
-                                        >
-                                            {signature ? (
-                                                <Image source={{ uri: signature }} style={s.signatureImage} resizeMode="contain" />
-                                            ) : (
-                                                <View style={s.signaturePlaceholder}>
-                                                    <MaterialCommunityIcons name="pencil-lock-outline" size={32} color="#ADB5BD" />
-                                                    <Text style={s.signaturePlaceholderText}>{t('click_to_sign')}</Text>
+                                    <View style={s.detailSection}>
+                                        <SectionTitle>RAPPORT DE RÉSOLUTION 8D</SectionTitle>
+                                        <View style={{ marginVertical: 16 }}>
+                                            <StepperRow steps={STEPS_8D} current={activeDStep} />
+                                        </View>
+
+                                        <View style={s.dStepContainer}>
+                                            <Text style={s.dStepTitle}>{STEPS_8D[activeDStep]}</Text>
+                                            <TextInput
+                                                style={[s.dStepInput, (selectedFnc.status === 'CLOTUREE' || !canPerformAction('create_fnc')) && s.dStepInputLocked]}
+                                                multiline
+                                                value={dContent ?? ''}
+                                                onChangeText={setDContent}
+                                                placeholder={selectedFnc.status === 'CLOTUREE' ? '' : !canPerformAction('create_fnc') ? 'Lecture seule' : `Saisir les informations pour ${STEPS_8D[activeDStep]}...`}
+                                                editable={selectedFnc.status !== 'CLOTUREE' && canPerformAction('create_fnc')}
+                                            />
+                                            {activeDStep === 7 && (
+                                                <View style={{ marginTop: 16 }}>
+                                                    <Text style={s.dStepTitle}>SIGNATURE ÉLECTRONIQUE</Text>
+                                                    <TouchableOpacity
+                                                        style={s.signatureBox}
+                                                        onPress={() => setIsSigModalVisible(true)}
+                                                        disabled={selectedFnc.status === 'CLOTUREE' || !canPerformAction('create_fnc')}
+                                                    >
+                                                        {signature ? (
+                                                            <Image source={{ uri: signature }} style={s.signatureImage} resizeMode="contain" />
+                                                        ) : (
+                                                            <View style={s.signaturePlaceholder}>
+                                                                <MaterialCommunityIcons name="pencil-lock-outline" size={32} color="#ADB5BD" />
+                                                                <Text style={s.signaturePlaceholderText}>{t('click_to_sign')}</Text>
+                                                            </View>
+                                                        )}
+                                                    </TouchableOpacity>
                                                 </View>
                                             )}
-                                        </TouchableOpacity>
-                                    </View>
-                                )}
-                                {selectedFnc.status !== 'CLOTUREE' && canPerformAction('create_fnc') && (
-                                    <View style={{ marginTop: 12, alignItems: 'flex-end' }}>
-                                        <ActionButton
-                                            label={isSavingD ? "Enregistrement..." : "Valider cette étape"}
-                                            variant="primary"
-                                            onPress={handleSaveDStep}
-                                            disabled={isSavingD}
-                                        />
-                                    </View>
-                                )}
-
-                            </View>
-                        </View>
-
-                        <Divider />
-
-                        <View style={s.detailSection}>
-                            <SectionTitle>HISTORIQUE DES MODIFICATIONS 8D</SectionTitle>
-                            <View style={s.historyList}>
-                                {history.length === 0 ? (
-                                    <Text style={s.noHistory}>{t('fnc_no_history')}</Text>
-                                ) : (
-                                    history.map((log: any) => (
-                                        <View key={log.id} style={s.historyItem}>
-                                            <View style={s.historyDot} />
-                                            <View style={{ flex: 1 }}>
-                                                <Text style={s.historyUser}>{log.user?.full_name || 'Système'} <Text style={s.historyDate}>· {new Date(log.created_at).toLocaleString('fr-FR')}</Text></Text>
-                                                <Text style={s.historyAction}>Mise à jour de : <Text style={{ fontWeight: '700' }}>{Object.keys(log.new_data || {}).map(k => FIELD_LABELS[k] || k).join(', ')}</Text></Text>
-                                                {log.action === 'UPDATE' && log.old_data && (
-                                                    <View style={{ marginTop: 8 }}>
-                                                        <ActionButton
-                                                            label="Comparer les versions"
-                                                            icon="compare-horizontal"
-                                                            variant="secondary"
-                                                            onPress={() => {
-                                                                setSelectedAuditLogForCompare(log);
-                                                                setCompareModalVisible(true);
-                                                            }}
-                                                            disabled={!log.old_data || !log.new_data}
-                                                        />
-                                                    </View>
-                                                )}
-                                            </View>
+                                            {selectedFnc.status !== 'CLOTUREE' && canPerformAction('create_fnc') && (
+                                                <View style={{ marginTop: 12, alignItems: 'flex-end' }}>
+                                                    <ActionButton
+                                                        label={isSavingD ? "Enregistrement..." : "Valider cette étape"}
+                                                        variant="primary"
+                                                        onPress={handleSaveDStep}
+                                                        disabled={isSavingD}
+                                                    />
+                                                </View>
+                                            )}
                                         </View>
-                                    ))
-                                )}
-                            </View>
-                        </View>
-
-                        <View style={s.detailSection}>
-                            <SectionTitle>LOT CONCERNÉ</SectionTitle>
-                            <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_lot_number')}:</Text><Text style={s.detailValue}>{selectedFnc.lot_code}</Text></View>
-                            <View style={s.detailRow}><Text style={s.detailLabel}>Article :</Text><Text style={s.detailValue}>{selectedFnc.article_name}</Text></View>
-                        </View>
-
-                        <View style={{ marginBottom: 20 }}>
-                            <ActionButton label="Exporter Rapport 8D (PDF)" icon="file-pdf-box" onPress={generate8DPdf} disabled={isGeneratingPdf} />
-                        </View>
-
-                        {selectedFnc.status === 'CLOTUREE' && role === 'ADMIN' && (
-                            <View style={{ marginBottom: 20 }}>
-                                <ActionButton
-                                    label="Réouvrir la FNC (Admin)"
-                                    icon="lock-open-outline"
-                                    variant="secondary"
-                                    onPress={() => handleReopenFnc(selectedFnc.id)}
-                                    disabled={mutation.isPending}
-                                />
-                            </View>
-                        )}
-
-                        {selectedFnc.status === 'A_VALIDER' && activeDStep === 7 && (
-                            <View style={s.detailActions}>
-                                {canPerformAction('create_fnc') ? (
-                                    <ActionButton
-                                        label="Approuver & Clôturer la FNC"
-                                        icon="check-circle-outline"
-                                        variant="primary"
-                                        onPress={() => handleCloseFnc(selectedFnc.id)}
-                                        disabled={mutation.isPending}
-                                    />
-                                ) : (
-                                    <View style={s.restrictedBox}>
-                                        <MaterialCommunityIcons name="shield-lock" size={20} color="#6C757D" />
-                                        <Text style={s.restrictedText}>En attente de validation par le Responsable Qualité (RQ) ou l'Admin.</Text>
                                     </View>
-                                )}
 
-                                {canPerformAction('assign_fnc') && (
-                                    <ActionButton
-                                        label="Assigner"
-                                        icon="account-arrow-right-outline"
-                                        onPress={handleOpenAssign}
-                                        disabled={mutation.isPending}
-                                    />
-                                )}
-                            </View>
-                        )}
+                                    <Divider />
+
+                                    <View style={s.detailSection}>
+                                        <SectionTitle>HISTORIQUE DES MODIFICATIONS 8D</SectionTitle>
+                                        <View style={s.historyList}>
+                                            {history.length === 0 ? (
+                                                <Text style={s.noHistory}>{t('fnc_no_history')}</Text>
+                                            ) : (
+                                                history.map((log: any) => (
+                                                    <View key={log.id} style={s.historyItem}>
+                                                        <View style={s.historyDot} />
+                                                        <View style={{ flex: 1 }}>
+                                                            <Text style={s.historyUser}>{log.user?.full_name || 'Système'} <Text style={s.historyDate}>· {new Date(log.created_at).toLocaleString('fr-FR')}</Text></Text>
+                                                            <Text style={s.historyAction}>Mise à jour de : <Text style={{ fontWeight: '700' }}>{Object.keys(log.new_data || {}).filter(k => FIELD_LABELS[k]).map(k => FIELD_LABELS[k]).join(', ') || 'Mise à jour générale'}</Text></Text>
+                                                            {log.action === 'UPDATE' && log.old_data && (
+                                                                <View style={{ marginTop: 8 }}>
+                                                                    <ActionButton
+                                                                        label="Comparer les versions"
+                                                                        icon="compare-horizontal"
+                                                                        variant="secondary"
+                                                                        onPress={() => {
+                                                                            setSelectedAuditLogForCompare(log);
+                                                                            setCompareModalVisible(true);
+                                                                        }}
+                                                                        disabled={!log.old_data || !log.new_data}
+                                                                    />
+                                                                </View>
+                                                            )}
+                                                        </View>
+                                                    </View>
+                                                ))
+                                            )}
+                                        </View>
+                                    </View>
+
+                                    <View style={s.detailSection}>
+                                        <SectionTitle>LOT CONCERNÉ</SectionTitle>
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>{t('fnc_lot_number')}:</Text><Text style={s.detailValue}>{selectedFnc.lot_code}</Text></View>
+                                        <View style={s.detailRow}><Text style={s.detailLabel}>Article :</Text><Text style={s.detailValue}>{selectedFnc.article_name}</Text></View>
+                                    </View>
+
+                                    <View style={{ marginBottom: 20 }}>
+                                        <ActionButton label="Exporter Rapport 8D (PDF)" icon="file-pdf-box" onPress={generate8DPdf} disabled={isGeneratingPdf} />
+                                    </View>
+
+                                    {selectedFnc.status === 'CLOTUREE' && role === 'ADMIN' && (
+                                        <View style={{ marginBottom: 20 }}>
+                                            <ActionButton
+                                                label="Réouvrir la FNC (Admin)"
+                                                icon="lock-open-outline"
+                                                variant="secondary"
+                                                onPress={() => handleReopenFnc(selectedFnc.id)}
+                                                disabled={mutation.isPending}
+                                            />
+                                        </View>
+                                    )}
+
+                                    {(selectedFnc.status === 'A_VALIDER' || selectedFnc.status === 'CLOTUREE') && (
+                                        <View style={s.detailSection}>
+                                            <SectionTitle>DÉCISION QUALITÉ & EFFICACITÉ</SectionTitle>
+                                            {selectedFnc.status === 'CLOTUREE' ? (
+                                                <>
+                                                    <View style={s.detailRow}>
+                                                        <Text style={s.detailLabel}>Décision :</Text>
+                                                        {selectedFnc.decision_type ? (
+                                                            <Badge label={FNC_DECISION_MAP[selectedFnc.decision_type as FncDecisionType]?.label || selectedFnc.decision_type} color={FNC_DECISION_MAP[selectedFnc.decision_type as FncDecisionType]?.color || C.textMuted} />
+                                                        ) : <Text style={s.detailValue}>—</Text>}
+                                                    </View>
+                                                    {selectedFnc.decision_notes ? <View style={s.detailRow}><Text style={s.detailLabel}>Note décision :</Text><Text style={s.detailValue}>{selectedFnc.decision_notes}</Text></View> : null}
+                                                    <View style={s.detailRow}><Text style={s.detailLabel}>Efficacité vérifiée :</Text><Text style={s.detailValue}>{selectedFnc.efficacy_checked ? 'Oui' : 'Non'}</Text></View>
+                                                    {selectedFnc.efficacy_notes ? <View style={s.detailRow}><Text style={s.detailLabel}>Note efficacité :</Text><Text style={s.detailValue}>{selectedFnc.efficacy_notes}</Text></View> : null}
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <FormSelect
+                                                        label="Décision qualité *"
+                                                        value={decisionType}
+                                                        options={FNC_DECISION_OPTIONS}
+                                                        onSelect={(v: string) => setDecisionType(v as FncDecisionType)}
+                                                    />
+                                                    {decisionType ? (
+                                                        <Text style={{ fontSize: 12, color: C.textMuted, marginBottom: 8 }}>
+                                                            Workflow déclenché : {FNC_DECISION_MAP[decisionType].workflow} → notification {FNC_DECISION_MAP[decisionType].notifyRole}.
+                                                        </Text>
+                                                    ) : null}
+                                                    <FormInput label="Note décision (optionnel)" value={decisionNotes} onChangeText={setDecisionNotes} multiline />
+                                                    <TouchableOpacity
+                                                        style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10 }}
+                                                        onPress={() => setEfficacyChecked(v => !v)}
+                                                        disabled={!canPerformAction('create_fnc')}
+                                                    >
+                                                        <MaterialCommunityIcons name={efficacyChecked ? 'checkbox-marked' : 'checkbox-blank-outline'} size={24} color={efficacyChecked ? C.ok : C.textMuted} />
+                                                        <Text style={{ flex: 1, fontSize: 13, color: C.textPrimary }}>Vérification d'efficacité des actions correctives (D6) validée *</Text>
+                                                    </TouchableOpacity>
+                                                    <FormInput label="Note efficacité (optionnel)" value={efficacyNotes} onChangeText={setEfficacyNotes} multiline />
+                                                </>
+                                            )}
+                                        </View>
+                                    )}
+
+                                    {selectedFnc.status === 'A_VALIDER' && activeDStep === 7 && (
+                                        <View style={s.detailActions}>
+                                            {canPerformAction('create_fnc') ? (
+                                                <ActionButton
+                                                    label="Approuver & Clôturer la FNC"
+                                                    icon="check-circle-outline"
+                                                    variant="primary"
+                                                    onPress={() => handleCloseFnc(selectedFnc.id)}
+                                                    disabled={mutation.isPending || !efficacyChecked || !decisionType}
+                                                />
+                                            ) : (
+                                                <View style={s.restrictedBox}>
+                                                    <MaterialCommunityIcons name="shield-lock" size={20} color="#6C757D" />
+                                                    <Text style={s.restrictedText}>En attente de validation par le Responsable Qualité (RQ) ou l'Admin.</Text>
+                                                </View>
+                                            )}
+
+                                            {canPerformAction('assign_fnc') && (
+                                                <ActionButton
+                                                    label="Assigner"
+                                                    icon="account-arrow-right-outline"
+                                                    onPress={handleOpenAssign}
+                                                    disabled={mutation.isPending}
+                                                />
+                                            )}
+                                        </View>
+                                    )}
+
+                                    {/* Bouton Fermer en bas */}
+                                    <View style={{ marginTop: 16, alignItems: 'flex-end' }}>
+                                        <ActionButton label="Annuler" variant="secondary" onPress={() => setSelId(null)} />
+                                    </View>
+                                </View>
+                            )}
+                        </ScrollView>
                     </View>
-                )}
-            </FormModal>
+                </View>
+            </Modal>
 
             {/* Modal d'assignation FNC */}
             <FormModal
@@ -749,15 +986,16 @@ export function FncScreen() {
                     onSelect={v => setFormData({ ...formData, severity: v })}
                 />
                 <FormInput label="Description détaillée" value={formData.description ?? ''} onChangeText={val => setFormData({ ...formData, description: val })} multiline />
+                {/* FIX 3 — Assignation par utilisateur réel (full_name) pour cohérence avec le modal "Assigner" */}
                 <FormSelect
-                    label="Assigné à"
+                    label="Assigné à (optionnel)"
                     value={formData.assigned_to ?? ''}
-                    options={[
-                        { label: 'Responsable Qualité (RQ)', value: 'RQ' },
-                        { label: 'Responsable Production (RPROD)', value: 'RPROD' },
-                        { label: 'Magasinier (MAGA)', value: 'MAGA' },
-                    ]}
+                    options={users
+                        .filter((u: any) => u.active)
+                        .map((u: any) => ({ label: `${u.full_name || u.email} (${u.role})`, value: u.full_name || u.email }))
+                    }
                     onSelect={v => setFormData({ ...formData, assigned_to: v })}
+                    searchable
                 />
             </FormModal>
 
@@ -780,7 +1018,7 @@ export function FncScreen() {
 
                         <Text style={s.diffTitle}>CHANGEMENTS EFFECTUÉS</Text>
                         <View style={s.diffContainer}>
-                            {Object.keys(selectedAuditLogForCompare.new_data || {}).map(key =>
+                            {Object.keys(selectedAuditLogForCompare.new_data || {}).filter(key => FIELD_LABELS[key]).map(key =>
                                 renderDiffItem(key, selectedAuditLogForCompare.old_data[key], selectedAuditLogForCompare.new_data[key])
                             )}
                         </View>
@@ -849,4 +1087,39 @@ const s = StyleSheet.create({
     diffKey: { flex: 1, fontSize: 12, fontWeight: '700', color: '#495057' },
     diffOld: { flex: 1.5, fontSize: 12, color: C.err, textDecorationLine: 'line-through' },
     diffNew: { flex: 1.5, fontSize: 12, color: C.ok, fontWeight: '600' },
+    // Styles du modal de détail natif (fix TextInput non-éditable sur RN Web)
+    detailModalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        padding: 20,
+    },
+    detailModalBox: {
+        backgroundColor: '#FFF',
+        borderRadius: 16,
+        width: '100%',
+        maxWidth: 680,
+        maxHeight: '90%',
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 8 },
+        shadowOpacity: 0.15,
+        shadowRadius: 24,
+        elevation: 12,
+    },
+    detailModalHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        padding: 20,
+        borderBottomWidth: 1,
+        borderBottomColor: '#F1F3F5',
+    },
+    detailModalTitle: {
+        fontSize: 18,
+        fontWeight: '800',
+        color: '#1A1A1A',
+        flex: 1,
+        marginRight: 12,
+    },
 });
