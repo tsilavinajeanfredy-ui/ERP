@@ -2,7 +2,7 @@ import * as React from 'react';
 import { ScrollView, StyleSheet, Text, View, TouchableOpacity, ActivityIndicator, Alert, Platform} from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { C, AnimatedPage, FormSelect, Badge, ActionButton, FormModal, FormInput } from '../components/Ui';
-import { useLots, useLotGenealogy, useLotDownstream, useRecallLot } from '../lib/hooks';
+import { useLots, useLotGenealogy, useLotDownstream, useRecallLot, useLotFullTraceability } from '../lib/hooks';
 import { generatePdf, getPdfTemplate } from '../lib/pdf';
 import { useTranslation } from '../lib/i18n';
 
@@ -10,9 +10,14 @@ import { useTranslation } from '../lib/i18n';
 export function TraceabilityScreen() {
   const { data: lots = [] } = useLots(0, 999);
   const { t } = useTranslation();
+  const [traceMode, setTraceMode] = React.useState<'genealogy' | 'full'>('genealogy');
   const [selLotId, setSelLotId] = React.useState<string | null>(null);
   const { data: genealogy, isPending: genLoading } = useLotGenealogy(selLotId ?? undefined);
   const { data: downstream = [], isPending: downLoading } = useLotDownstream(selLotId ?? undefined);
+  // M3 : traçabilité complète BP→DA→LO MP→Lot PF
+  const { data: fullTrace, isPending: fullTraceLoading } = useLotFullTraceability(
+    traceMode === 'full' ? (selLotId ?? undefined) : undefined
+  );
 
   // États pour la procédure de rappel (Recall Management)
   const [recallModalVisible, setRecallModalVisible] = React.useState(false);
@@ -42,9 +47,158 @@ export function TraceabilityScreen() {
           />
         </View>
 
-        {genLoading || downLoading ? (
+        <View style={{ marginBottom: 24 }}>
+          <FormSelect
+            label="Sélectionner un lot"
+            value={selLotId ?? ''}
+            options={lots.map(l => ({ label: `${l.code} - ${l.article?.name || ''} (${l.qty_current} ${l.unit})`, value: l.id }))}
+            onSelect={v => setSelLotId(v)}
+          />
+        </View>
+
+        {/* M3 : Sélecteur de mode de traçabilité */}
+        {selLotId && (
+          <View style={{ flexDirection: 'row', gap: 8, marginBottom: 20 }}>
+            {([{ key: 'genealogy', label: 'Arbre généalogique', icon: 'file-tree' }, { key: 'full', label: 'Traçabilité BP complète', icon: 'sitemap' }] as const).map(mode => (
+              <TouchableOpacity
+                key={mode.key}
+                onPress={() => setTraceMode(mode.key)}
+                style={{ flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 10, borderRadius: 10, borderWidth: 2, borderColor: traceMode === mode.key ? C.info : '#E9ECEF', backgroundColor: traceMode === mode.key ? '#EEF2FF' : '#F8F9FA' }}
+              >
+                <MaterialCommunityIcons name={mode.icon as any} size={16} color={traceMode === mode.key ? C.info : '#6C757D'} />
+                <Text style={{ fontSize: 12, fontWeight: '700', color: traceMode === mode.key ? C.info : '#6C757D' }}>{mode.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
+
+        {/* M3 : Vue traçabilité complète BP → DA → LO MP → Lot PF */}
+        {traceMode === 'full' && selLotId && (
+          fullTraceLoading ? (
+            <ActivityIndicator size="large" color={C.info} style={{ marginVertical: 40 }} />
+          ) : fullTrace ? (
+            <View style={{ gap: 16 }}>
+              {/* Lot PF */}
+              <View style={{ backgroundColor: '#1A1A1A', borderRadius: 14, padding: 18 }}>
+                <Text style={{ fontSize: 10, fontWeight: '800', color: '#ADB5BD', letterSpacing: 1, marginBottom: 6 }}>LOT PRODUIT FINI</Text>
+                <Text style={{ fontSize: 18, fontWeight: '800', color: '#FFF' }}>{fullTrace.lot?.code}</Text>
+                <Text style={{ fontSize: 14, color: '#D1D5DB', marginTop: 4 }}>{fullTrace.lot?.article?.name}</Text>
+                <View style={{ flexDirection: 'row', gap: 16, marginTop: 10 }}>
+                  <View>
+                    <Text style={{ fontSize: 10, color: '#ADB5BD', fontWeight: '600' }}>QUANTITÉ</Text>
+                    <Text style={{ fontSize: 14, color: '#FFF', fontWeight: '700' }}>{fullTrace.lot?.qty_current} {fullTrace.lot?.article?.unit}</Text>
+                  </View>
+                  <View>
+                    <Text style={{ fontSize: 10, color: '#ADB5BD', fontWeight: '600' }}>STATUT CQ</Text>
+                    <Badge label={fullTrace.lot?.cqlib_status || '—'} color={fullTrace.lot?.cqlib_status === 'LIBERE' ? C.ok : fullTrace.lot?.cqlib_status === 'BLOQUE' ? C.err : C.gold} />
+                  </View>
+                  <View>
+                    <Text style={{ fontSize: 10, color: '#ADB5BD', fontWeight: '600' }}>RÉCEPTION</Text>
+                    <Text style={{ fontSize: 14, color: '#FFF', fontWeight: '700' }}>{fullTrace.lot?.reception_date ? new Date(fullTrace.lot.reception_date).toLocaleDateString() : '—'}</Text>
+                  </View>
+                </View>
+              </View>
+
+              {/* Connecteur */}
+              <View style={{ alignItems: 'center' }}>
+                <View style={{ width: 2, height: 20, backgroundColor: '#CBD5E1' }} />
+                <MaterialCommunityIcons name="chevron-down" size={20} color="#CBD5E1" />
+              </View>
+
+              {/* OF (Bon de Production) */}
+              {fullTrace.of ? (
+                <View style={{ backgroundColor: '#FFF', borderRadius: 14, padding: 18, borderWidth: 1.5, borderColor: C.info }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <View style={{ width: 32, height: 32, borderRadius: 8, backgroundColor: '#EEF2FF', justifyContent: 'center', alignItems: 'center' }}>
+                      <MaterialCommunityIcons name="factory" size={18} color={C.info} />
+                    </View>
+                    <View>
+                      <Text style={{ fontSize: 10, fontWeight: '800', color: '#ADB5BD', letterSpacing: 1 }}>BON DE PRODUCTION (OF)</Text>
+                      <Text style={{ fontSize: 15, fontWeight: '800', color: '#1A1A1A' }}>{fullTrace.of.code}</Text>
+                    </View>
+                    <Badge label={fullTrace.of.status} color={fullTrace.of.status === 'CLOTURE' ? '#6C757D' : fullTrace.of.status === 'EN_COURS' ? C.gold : C.ok} />
+                  </View>
+                  <Text style={{ fontSize: 13, color: '#6C757D' }}>Produit : {fullTrace.of.product?.name}</Text>
+                  <Text style={{ fontSize: 12, color: '#9CA3AF', marginTop: 4 }}>
+                    Qté planifiée : {fullTrace.of.qty_planned} · Produite : {fullTrace.of.qty_produced ?? '—'}
+                  </Text>
+                  {fullTrace.of.started_at && (
+                    <Text style={{ fontSize: 11, color: '#9CA3AF', marginTop: 2 }}>
+                      Démarré : {new Date(fullTrace.of.started_at).toLocaleString()}
+                    </Text>
+                  )}
+                  {/* Sous-OF SF liés */}
+                  {fullTrace.subOfs?.length > 0 && (
+                    <View style={{ marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#E5E7EB' }}>
+                      <Text style={{ fontSize: 11, fontWeight: '700', color: '#0891B2', marginBottom: 6 }}>SOUS-OF SEMI-FINIS ({fullTrace.subOfs.length})</Text>
+                      {fullTrace.subOfs.map((sf: any) => (
+                        <View key={sf.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: '#F1F5F9' }}>
+                          <MaterialCommunityIcons name="sitemap" size={14} color="#0891B2" />
+                          <Text style={{ flex: 1, fontSize: 12, color: '#374151' }}><Text style={{ fontWeight: '700' }}>{sf.code}</Text> — {sf.product?.name} · {sf.qty_planned} {sf.product?.unit}</Text>
+                          <Badge label={sf.status} color={sf.status === 'CLOTURE' ? '#6C757D' : C.gold} />
+                        </View>
+                      ))}
+                    </View>
+                  )}
+                </View>
+              ) : (
+                <View style={{ backgroundColor: '#FFF', borderRadius: 14, padding: 18, borderWidth: 1, borderColor: '#E5E7EB', alignItems: 'center' }}>
+                  <Text style={{ color: '#ADB5BD', fontSize: 13 }}>Aucun OF lié trouvé pour ce lot (origine : {fullTrace.lot?.origin || '—'})</Text>
+                </View>
+              )}
+
+              {/* Connecteur */}
+              <View style={{ alignItems: 'center' }}>
+                <View style={{ width: 2, height: 20, backgroundColor: '#CBD5E1' }} />
+                <MaterialCommunityIcons name="chevron-down" size={20} color="#CBD5E1" />
+              </View>
+
+              {/* Consommations MP */}
+              <View style={{ backgroundColor: '#FFF', borderRadius: 14, padding: 18, borderWidth: 1.5, borderColor: '#86EFAC' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                  <View style={{ width: 32, height: 32, borderRadius: 8, backgroundColor: '#F0FDF4', justifyContent: 'center', alignItems: 'center' }}>
+                    <MaterialCommunityIcons name="package-down" size={18} color="#16A34A" />
+                  </View>
+                  <Text style={{ fontSize: 10, fontWeight: '800', color: '#ADB5BD', letterSpacing: 1 }}>MATIÈRES PREMIÈRES CONSOMMÉES</Text>
+                </View>
+                {fullTrace.mpConsumptions?.length === 0 ? (
+                  <Text style={{ fontSize: 13, color: '#ADB5BD', fontStyle: 'italic' }}>Aucune consommation MP enregistrée pour cet OF.</Text>
+                ) : (
+                  fullTrace.mpConsumptions?.map((cons: any) => (
+                    <View key={cons.id} style={{ paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#F0FDF4' }}>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>{cons.article?.name}</Text>
+                          <Text style={{ fontSize: 11, color: '#6B7280', marginTop: 2 }}>Lot : {cons.lot?.code}</Text>
+                          {cons.lot?.da_import && (
+                            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 4 }}>
+                              <MaterialCommunityIcons name="truck-delivery-outline" size={12} color="#0891B2" />
+                              <Text style={{ fontSize: 11, color: '#0891B2', fontWeight: '600' }}>
+                                DA : {cons.lot.da_import.code} · {cons.lot.da_import.supplier?.name}
+                              </Text>
+                            </View>
+                          )}
+                          <Text style={{ fontSize: 10, color: '#9CA3AF', marginTop: 2 }}>
+                            {cons.consumed_at ? new Date(cons.consumed_at).toLocaleString() : ''}
+                          </Text>
+                        </View>
+                        <View style={{ alignItems: 'flex-end' }}>
+                          <Text style={{ fontSize: 14, fontWeight: '800', color: '#16A34A' }}>
+                            {cons.qty_consumed} {cons.unit}
+                          </Text>
+                        </View>
+                      </View>
+                    </View>
+                  ))
+                )}
+              </View>
+            </View>
+          ) : null
+        )}
+
+        {traceMode === 'genealogy' && (genLoading || downLoading) ? (
           <ActivityIndicator size="large" color={C.green} />
-        ) : selLotId && genealogy ? (() => {
+        ) : traceMode === 'genealogy' && selLotId && genealogy ? (() => {
           return (
             <View style={s.mainLayout}>
               {/* Left Column: Visual Tree Visualization */}

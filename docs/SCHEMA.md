@@ -296,6 +296,9 @@ complaint_severity → 'MINEURE' | 'MAJEURE' | 'CRITIQUE'
 | status | `da_status` | Statut global |
 | eta_date | `date` | ETA |
 | lead_time_days | `int` | Délai constaté |
+| date_arrivee_tamatave | `date` | Arrivée physique au port de Tamatave |
+| date_arrivee_usine | `date` | Arrivée physique à l'usine |
+| partial_receptions | `jsonb` | Liste des réceptions partielles |
 | sage_synced | `boolean` DEFAULT false | Sync SAGE |
 
 ### 15. `da_import_steps_log` — Historique des étapes Import

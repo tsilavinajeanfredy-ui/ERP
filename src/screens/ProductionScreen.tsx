@@ -2,13 +2,13 @@ import * as React from 'react';
 import { ScrollView, StyleSheet, Text, View, Platform, TouchableOpacity, useWindowDimensions, ActivityIndicator, Alert, Modal, TextInput, FlatList } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { C, KpiCard, ActionButton, Badge, FormModal, FormInput, FormSelect, FormDatePicker, SectionTitle, ExportOverlay, DataTable, AnimatedPage, PaginationControls } from '../components/Ui';
-import { useBoms, useBomLines, usePFWithBom, useBomLinesForProduct, useProductionOrders, useUserProfile, useMutation, useArticles, usePermissions, useLots, useForecasts, useSaveForecasts, useNotification, useTRS, confirmAction } from '../lib/hooks';
+import { useBoms, useBomLines, usePFWithBom, useBomLinesForProduct, useProductionOrders, useUserProfile, useMutation, useArticles, usePermissions, useLots, useForecasts, useSaveForecasts, useNotification, useTRS, confirmAction, useSubProductionOrders, useOfMpConsumptions, useSFWithBom } from '../lib/hooks';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation, translateProductName } from '../lib/i18n';
 import { Article, BomHeader, BomLine, Lot } from '../lib/database.types';
 import type { WorkBook } from 'xlsx';
 import { generatePdf, getPdfTemplate } from '../lib/pdf';
-import { supabase, getNextCode } from '../lib/supabase';
+import { supabase, getNextCode, computeExpiryDate } from '../lib/supabase';
 import * as XLSX from 'xlsx';
 
 // ─── Local types ─────────────────────────────────────────────────────────────
@@ -28,9 +28,11 @@ type ProductionOrder = {
   site_id: string | null;
   scope: string | null;
   bom_header_id: string | null;
+  parent_of_id: string | null;
+  of_type: 'PF' | 'SF';
   created_at: string;
   article?: Pick<Article, 'id' | 'code' | 'name' | 'name_en'> | null;
-  product?: Pick<Article, 'id' | 'code' | 'name' | 'unit'> | null;
+  product?: Pick<Article, 'id' | 'code' | 'name' | 'unit' | 'shelf_life_days'> | null;
 };
 
 type ProductionStop = {
@@ -197,7 +199,7 @@ function BomNode({
   );
 }
 
-export function ProductionScreen() {
+export function ProductionScreen({ navigation }: any) {
   const { width } = useWindowDimensions();
   const isMobile = width < 992;
   const queryClient = useQueryClient();
@@ -215,6 +217,7 @@ export function ProductionScreen() {
   const { data: orders = [], count: ordersCount, isPending: loadingOrders } = useProductionOrders(page, limit);
   // usePFWithBom : PF ayant au moins un BOM — synchronisé en temps réel (staleTime=0)
   const { data: pfWithBom = [] } = usePFWithBom();
+  const { data: sfWithBom = [] } = useSFWithBom(); // M3 : semi-finis avec BOM
   const { data: allArticles = [] } = useArticles(0, 2000); // Needed to map lines in BOM import
   const { data: lots = [] } = useLots(0, 500, 'LIBERE'); // Real stock
   const { canPerformAction } = usePermissions();
@@ -245,10 +248,18 @@ export function ProductionScreen() {
     return true;
   }, [scope]);
 
+  // ─── M3 : Filtre gamme BOM (déclaré avant useMemo)
+  const GAMMES = ['', 'SAVON', 'BOUGIE', 'ENCAUSTIQUE', 'PH', 'CORDE'] as const;
+  type Gamme = typeof GAMMES[number];
+  const [bomGammeFilter, setBomGammeFilter] = React.useState<Gamme>('');
+
   const filteredBoms = React.useMemo(() => boms.filter(b => {
     const product = allArticles.find(a => a.id === b.product_id);
-    return product ? filterByScope(product.name) : true;
-  }), [boms, allArticles, filterByScope]);
+    if (!product) return true;
+    const scopeMatch = filterByScope(product.name);
+    const gammeMatch = !bomGammeFilter || (product as any).gamme === bomGammeFilter;
+    return scopeMatch && gammeMatch;
+  }), [boms, allArticles, filterByScope, bomGammeFilter]);
 
   const filteredOrders = React.useMemo(() => orders.filter(o => {
     const product = allArticles.find(a => a.id === o.product_id);
@@ -281,6 +292,21 @@ export function ProductionScreen() {
 
   const [importing, setImporting] = React.useState(false);
   const [importProgress, setImportProgress] = React.useState(0);
+
+  // ─── M3 : Sous-OF de semi-finis ────────────────────────────────────────────
+  const [subOfModalVisible, setSubOfModalVisible] = React.useState(false);
+  const [subOfParent, setSubOfParent] = React.useState<ProductionOrder | null>(null);
+  const [subOfFormData, setSubOfFormData] = React.useState<OfFormData>({});
+  const [subOfCategory, setSubOfCategory] = React.useState('');
+  const [expandedSubOfsId, setExpandedSubOfsId] = React.useState<string | null>(null);
+  const [subOfsMap, setSubOfsMap] = React.useState<Record<string, any[]>>({});
+
+  // ─── M3 : Enregistrement consommation MP ───────────────────────────────────
+  const [mpConsoModalVisible, setMpConsoModalVisible] = React.useState(false);
+  const [mpConsoTargetOf, setMpConsoTargetOf] = React.useState<ProductionOrder | null>(null);
+  const [mpConsoEntries, setMpConsoEntries] = React.useState<Array<{ lot_id: string; article_id: string; qty: string; unit: string }>>([]);
+  const [mpConsoLoading, setMpConsoLoading] = React.useState(false);
+  const [mpConsoLotSearch, setMpConsoLotSearch] = React.useState('');
 
   // ─── Forecasts: stored in Supabase production_forecasts table ────────────────
   const { forecasts, isPending: forecastsLoading } = useForecasts();
@@ -481,6 +507,14 @@ export function ProductionScreen() {
   const [expandedOrderId, setExpandedOrderId] = React.useState<string | null>(null);
   const [stopsMap, setStopsMap] = React.useState<Record<string, any[]>>({});
   const [stopsLoading, setStopsLoading] = React.useState<string | null>(null);
+  // ── Sélection multiple des OF ──
+  const [selectedOfIds, setSelectedOfIds] = React.useState<string[]>([]);
+  const toggleOfSelect = React.useCallback((id: string) => {
+    setSelectedOfIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+  }, []);
+  const toggleOfSelectAll = React.useCallback((ids: string[]) => {
+    setSelectedOfIds((prev) => prev.length === ids.length ? [] : ids);
+  }, []);
 
 
 
@@ -526,7 +560,27 @@ export function ProductionScreen() {
       'Supprimer l\'OF',
       `Supprimer définitivement l'OF ${order.code} ?`,
       () => mutation.mutate({ id: order.id, type: 'DELETE' })
-    );
+    ,
+    'danger'
+  );
+  };
+
+  const handleDeleteSelectedOrders = () => {
+    if (selectedOfIds.length === 0) return;
+    const sel = filteredOrders.filter((o) => selectedOfIds.includes(o.id));
+    confirmAction(
+      'Supprimer les OF sélectionnés',
+      `Supprimer définitivement ${sel.length} OF ?\n\n${sel.slice(0, 5).map((o) => o.code).join(', ')}${sel.length > 5 ? '...' : ''}\n\nCette action est irréversible.`,
+      async () => {
+        for (const order of sel) {
+          await supabase!.from('production_orders').delete().eq('id', order.id);
+        }
+        queryClient.invalidateQueries({ queryKey: ['production_orders'] });
+        setSelectedOfIds([]);
+      }
+    ,
+    'danger'
+  );
   };
 
   const handleAddBom = async () => {
@@ -612,7 +666,9 @@ export function ProductionScreen() {
       'Confirmer',
       'Supprimer ce composant de la nomenclature ?',
       () => bomLineMutation.mutate({ id: lineId, type: 'DELETE' })
-    );
+    ,
+    'danger'
+  );
   };
 
   const handleUpdateBomLineQty = React.useCallback(async (lineId: string, newQty: number): Promise<void> => {
@@ -659,9 +715,13 @@ export function ProductionScreen() {
               Alert.alert('Erreur de suppression', (err as any)?.message || 'Impossible de supprimer la nomenclature. Elle est peut-être utilisée ailleurs (ex: dans un Ordre de Fabrication).');
             }
           }
-        );
+        ,
+    'warning'
+  );
       }
-    );
+    ,
+    'danger'
+  );
   };
 
   const handleSave = () => {
@@ -787,7 +847,9 @@ export function ProductionScreen() {
           setStartingOrderId(null);
         }
       }
-    );
+    ,
+    'success'
+  );
   };
 
   // ─── Ouvrir le formulaire d'arrêt ─────────────────────────────────────────
@@ -887,7 +949,12 @@ export function ProductionScreen() {
         qty_current: parseFloat(String(closeFormData.qty_produced)),
         unit: closeTargetOrder.product?.unit || 'kg',
         reception_date: new Date().toISOString().split('T')[0],
+        expiry_date: computeExpiryDate(
+          new Date().toISOString().split('T')[0],
+          closeTargetOrder.product?.shelf_life_days
+        ),
         origin: closeTargetOrder.code,
+        of_number: closeTargetOrder.code,   // lien structuré OF→lot (migration 073)
       };
 
       // Essaie EN_ATTENTE (nouveau workflow), fallback sur QUARANTAINE si migration non encore appliquée
@@ -918,6 +985,19 @@ export function ProductionScreen() {
       });
 
       setCloseModalVisible(false);
+
+      // ── Proposer navigation directe vers Réception PF ────────────────────
+      Alert.alert(
+        'OF clôturé ✓',
+        `Lot ${rpfCode} créé en Réception PF (EN ATTENTE).\nVoulez-vous y accéder maintenant ?`,
+        [
+          { text: 'Rester ici', style: 'cancel' },
+          {
+            text: 'Voir en Réception PF',
+            onPress: () => navigation.navigate('ReceptionPF'),
+          },
+        ]
+      );
     } catch (err: unknown) {
       Alert.alert('Erreur', (err instanceof Error ? err.message : undefined) || 'Impossible de clôturer l\'OF.');
     } finally {
@@ -971,6 +1051,120 @@ export function ProductionScreen() {
     CHANGEMENT: 'Changement prod.', AUTRE: 'Autre',
   };
 
+
+  // ─── M3 : Créer un sous-OF SF pour un OF parent ──────────────────────────
+  const handleOpenSubOfModal = async (parentOrder: ProductionOrder) => {
+    if (!supabase) return;
+    const year = new Date().getFullYear();
+    const scopePrefix = getScopePrefix();
+    let generatedCode = `OF-SF-${scopePrefix}-${year}-PEND`;
+    try {
+      generatedCode = await getNextCode(`OF-SF-${scopePrefix}`, 'production_orders', 'code');
+    } catch {}
+    setSubOfParent(parentOrder);
+    setSubOfFormData({
+      code: generatedCode,
+      status: 'PLANIFIE',
+      planned_date: parentOrder.planned_date || new Date().toISOString().split('T')[0],
+    });
+    setSubOfModalVisible(true);
+  };
+
+  const handleSaveSubOf = async () => {
+    if (!supabase || !subOfParent) return;
+    if (!subOfFormData.code || !subOfFormData.product_id || !subOfFormData.bom_header_id) {
+      Alert.alert('Champs requis', 'Veuillez sélectionner le semi-fini, la nomenclature et la quantité.');
+      return;
+    }
+    try {
+      const { error } = await supabase.from('production_orders').insert({
+        code: subOfFormData.code,
+        product_id: subOfFormData.product_id,
+        bom_header_id: subOfFormData.bom_header_id,
+        qty_planned: parseFloat(String(subOfFormData.qty_planned || 0)),
+        planned_date: subOfFormData.planned_date,
+        status: 'PLANIFIE',
+        of_type: 'SF',
+        parent_of_id: subOfParent.id,
+      });
+      if (error) throw error;
+      queryClient.invalidateQueries({ queryKey: ['production_orders'] });
+      // Rafraîchir les sous-OF dans la map locale
+      setSubOfsMap(prev => { const next = { ...prev }; delete next[subOfParent.id]; return next; });
+      setSubOfModalVisible(false);
+      notify.mutate({
+        to_role: 'RPROD',
+        subject: `Sous-OF SF créé pour ${subOfParent.code}`,
+        message: `Sous-OF ${subOfFormData.code} (semi-fini) créé et lié à l'OF principal ${subOfParent.code}.`,
+        type: 'internal',
+        category: 'PRODUCTION',
+        metadata: { category: 'PRODUCTION', screen: 'Production' },
+      });
+    } catch (err: unknown) {
+      Alert.alert('Erreur', (err instanceof Error ? err.message : undefined) || 'Impossible de créer le sous-OF.');
+    }
+  };
+
+  const handleToggleSubOfs = async (orderId: string) => {
+    if (expandedSubOfsId === orderId) { setExpandedSubOfsId(null); return; }
+    setExpandedSubOfsId(orderId);
+    if (subOfsMap[orderId]) return;
+    if (!supabase) return;
+    try {
+      const { data, error } = await supabase
+        .from('production_orders')
+        .select('*, product:articles(id, code, name, unit, article_type, shelf_life_days)')
+        .eq('parent_of_id', orderId)
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+      setSubOfsMap(prev => ({ ...prev, [orderId]: data || [] }));
+    } catch {}
+  };
+
+  // ─── M3 : Enregistrer consommations MP ────────────────────────────────────
+  const handleOpenMpConso = (order: ProductionOrder) => {
+    setMpConsoTargetOf(order);
+    setMpConsoEntries([{ lot_id: '', article_id: '', qty: '', unit: 'kg' }]);
+    setMpConsoLotSearch('');
+    setMpConsoModalVisible(true);
+  };
+
+  const handleAddMpConsoLine = () => {
+    setMpConsoEntries(prev => [...prev, { lot_id: '', article_id: '', qty: '', unit: 'kg' }]);
+  };
+
+  const handleRemoveMpConsoLine = (idx: number) => {
+    setMpConsoEntries(prev => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleSaveMpConso = async () => {
+    if (!supabase || !mpConsoTargetOf) return;
+    const valid = mpConsoEntries.filter(e => e.lot_id && e.qty && parseFloat(e.qty) > 0);
+    if (valid.length === 0) {
+      Alert.alert('Champs requis', 'Veuillez saisir au moins un lot et une quantité.');
+      return;
+    }
+    setMpConsoLoading(true);
+    try {
+      const rows = valid.map(e => ({
+        of_id: mpConsoTargetOf.id,
+        lot_id: e.lot_id,
+        article_id: e.article_id,
+        qty_consumed: parseFloat(e.qty),
+        unit: e.unit,
+        consumed_at: new Date().toISOString(),
+      }));
+      const { error } = await supabase.from('of_mp_consumptions').insert(rows);
+      if (error) throw error;
+      queryClient.invalidateQueries({ queryKey: ['of_mp_consumptions', mpConsoTargetOf.id] });
+      setMpConsoModalVisible(false);
+      Alert.alert('Succès', `${valid.length} consommation(s) enregistrée(s) pour ${mpConsoTargetOf.code}.`);
+    } catch (err: unknown) {
+      Alert.alert('Erreur', (err instanceof Error ? err.message : undefined) || 'Impossible d\'enregistrer les consommations.');
+    } finally {
+      setMpConsoLoading(false);
+    }
+  };
 
   const handleImportPDP = (mode: 'update' | 'replace') => {
     setImportModalVisible(false);
@@ -1073,16 +1267,29 @@ export function ProductionScreen() {
             for (let i = 1; i < nonEmpty.length; i++) {
               const cols = nonEmpty[i];
               const productCode = String(cols[codeColIdx] ?? '').trim();
-              if (!productCode) continue;
+              const rubrique = firstMonthColIdx > 1 ? String(cols[1] ?? '').trim() : '';
 
-              // Try matching by code first, then by name (RUBRIQUE column if present)
-              let product = allArticles.find(a => a.code === productCode);
-              if (!product && firstMonthColIdx > 1) {
-                const rubrique = String(cols[1] ?? '').trim();
-                if (rubrique) product = allArticles.find(a => a.name.trim() === rubrique || a.name.trim().toLowerCase() === rubrique.toLowerCase());
+              // Matching : RUBRIQUE (col B) en priorité, puis code (col A) en fallback
+              let product: typeof allArticles[0] | undefined;
+
+              // 1️⃣ Matching par RUBRIQUE (nom exact, puis insensible à la casse, puis inclusion)
+              if (rubrique) {
+                product = allArticles.find(a => a.name.trim() === rubrique)
+                  ?? allArticles.find(a => a.name.trim().toLowerCase() === rubrique.toLowerCase())
+                  ?? allArticles.find(a =>
+                      a.name.trim().toLowerCase().includes(rubrique.toLowerCase()) ||
+                      rubrique.toLowerCase().includes(a.name.trim().toLowerCase())
+                    );
               }
+
+              // 2️⃣ Fallback : matching par code (col A) si rubrique n'a rien donné
+              if (!product && productCode) {
+                product = allArticles.find(a => a.code === productCode)
+                  ?? allArticles.find(a => a.sage_code && a.sage_code === productCode);
+              }
+
               if (!product) {
-                unmatchedCodes.push(productCode);
+                unmatchedCodes.push(rubrique || productCode);
                 continue;
               }
 
@@ -1125,7 +1332,7 @@ export function ProductionScreen() {
                 setImportProgress(1);
                 const modeLabel = mode === 'replace' ? 'Année remplacée' : 'Mise à jour';
                 const warningMsg = unmatchedCodes.length > 0
-                  ? `\n\nAttention: ${unmatchedCodes.length} code(s) non trouvé(s) dans le référentiel : ${unmatchedCodes.slice(0, 5).join(', ')}${unmatchedCodes.length > 5 ? '…' : ''}`
+                  ? `\n\n⚠️ ${unmatchedCodes.length} rubrique(s) non trouvée(s) dans le référentiel articles :\n${unmatchedCodes.slice(0, 8).join('\n')}${unmatchedCodes.length > 8 ? `\n… et ${unmatchedCodes.length - 8} autres` : ''}`
                   : '';
                 Alert.alert(`Import réussi — ${modeLabel}`, `${matchedCount} produit(s) mis à jour depuis "${file.name}".${warningMsg}`);
               })
@@ -1249,7 +1456,7 @@ export function ProductionScreen() {
               </tr>
             </thead>
             <tbody>
-              ${lines.map(l => `
+              ${lines.map((l: any) => `
                 <tr>
                   <td style="padding: 10px; border: 1px solid #DEE2E6;">${l.component ? getProductName(l.component) : '—'}</td>
                   <td style="padding: 10px; border: 1px solid #DEE2E6;">${l.component?.code || '—'}</td>
@@ -1439,6 +1646,40 @@ export function ProductionScreen() {
           data={filteredOrders}
           keyExtractor={order => order.id}
           scrollEnabled={false}
+          ListHeaderComponent={
+            filteredOrders.length > 0 ? (
+              <TouchableOpacity
+                onPress={() => toggleOfSelectAll(filteredOrders.map((o) => o.id))}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 8,
+                  paddingHorizontal: 12,
+                  paddingVertical: 8,
+                  backgroundColor: '#F8F9FA',
+                  borderBottomWidth: 1,
+                  borderBottomColor: '#E9ECEF',
+                }}
+              >
+                <MaterialCommunityIcons
+                  name={
+                    filteredOrders.length > 0 && filteredOrders.every((o) => selectedOfIds.includes(o.id))
+                      ? 'checkbox-marked'
+                      : filteredOrders.some((o) => selectedOfIds.includes(o.id))
+                        ? 'minus-box'
+                        : 'checkbox-blank-outline'
+                  }
+                  size={18}
+                  color={selectedOfIds.length > 0 ? '#2563EB' : '#94A3B8'}
+                />
+                <Text style={{ fontSize: 12, color: '#6B7280', fontWeight: '600' }}>
+                  {selectedOfIds.length > 0
+                    ? `${selectedOfIds.length} OF sélectionné(s) — Tout désélectionner`
+                    : `Sélectionner tous les OF (${filteredOrders.length})`}
+                </Text>
+              </TouchableOpacity>
+            ) : null
+          }
           renderItem={({ item: order }) => {
             const isExpanded = expandedOrderId === order.id;
             const stops = stopsMap[order.id] || [];
@@ -1448,7 +1689,17 @@ export function ProductionScreen() {
             return (
               <View>
                 {/* ── Ligne principale ── */}
-                <View style={s.orderRow}>
+                <View style={[s.orderRow, selectedOfIds.includes(order.id) && { backgroundColor: '#EFF6FF', borderLeftWidth: 3, borderLeftColor: '#2563EB' }]}>
+                  <TouchableOpacity
+                    onPress={() => toggleOfSelect(order.id)}
+                    style={{ paddingRight: 10, alignSelf: 'center' }}
+                  >
+                    <MaterialCommunityIcons
+                      name={selectedOfIds.includes(order.id) ? 'checkbox-marked' : 'checkbox-blank-outline'}
+                      size={18}
+                      color={selectedOfIds.includes(order.id) ? '#2563EB' : '#CBD5E1'}
+                    />
+                  </TouchableOpacity>
                   <View style={{ flex: 1 }}>
                     <Text style={s.orderRef}>{order.code}</Text>
                     <Text style={s.orderTitle}>{order.product ? getProductName(order.product) : t('loading')}</Text>
@@ -1486,6 +1737,18 @@ export function ProductionScreen() {
                           </Text>
                         </TouchableOpacity>
                       )}
+                      {/* M3 : Bouton sous-OF SF */}
+                      {(order.status === 'EN_COURS' || order.status === 'CLOTURE') && (
+                        <TouchableOpacity
+                          onPress={() => handleToggleSubOfs(order.id)}
+                          style={{ flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, backgroundColor: expandedSubOfsId === order.id ? '#E0F2FE' : '#F8F9FA', borderWidth: 1, borderColor: expandedSubOfsId === order.id ? '#0891B2' : '#E9ECEF' }}
+                        >
+                          <MaterialCommunityIcons name="sitemap" size={15} color="#0891B2" />
+                          <Text style={{ fontSize: 11, fontWeight: '700', color: '#0891B2' }}>
+                            {(subOfsMap[order.id] || []).length} SF
+                          </Text>
+                        </TouchableOpacity>
+                      )}
                       <Badge label={order.status} color={order.status === 'PLANIFIE' ? C.info : order.status === 'EN_COURS' ? C.gold : order.status === 'CLOTURE' ? '#6C757D' : C.ok} />
                     </View>
                     {/* ── Actions contextuelles selon le statut ── */}
@@ -1510,6 +1773,22 @@ export function ProductionScreen() {
                           >
                             <MaterialCommunityIcons name="pause" size={13} color="#FFF" />
                             <Text style={s.actionBtnText}> Déclarer arrêt</Text>
+                          </TouchableOpacity>
+                          {/* M3 : Enregistrer consommations MP */}
+                          <TouchableOpacity
+                            onPress={() => handleOpenMpConso(order)}
+                            style={[s.actionBtn, { backgroundColor: '#6366F1' }]}
+                          >
+                            <MaterialCommunityIcons name="package-down" size={13} color="#FFF" />
+                            <Text style={s.actionBtnText}> Conso MP</Text>
+                          </TouchableOpacity>
+                          {/* M3 : Créer sous-OF SF */}
+                          <TouchableOpacity
+                            onPress={() => handleOpenSubOfModal(order)}
+                            style={[s.actionBtn, { backgroundColor: '#0891B2' }]}
+                          >
+                            <MaterialCommunityIcons name="sitemap" size={13} color="#FFF" />
+                            <Text style={s.actionBtnText}> Sous-OF SF</Text>
                           </TouchableOpacity>
                           {canPerformAction('edit_production_order') && (
                             <TouchableOpacity
@@ -1586,6 +1865,46 @@ export function ProductionScreen() {
                     )}
                   </View>
                 )}
+
+                {/* M3 ── Panneau sous-OF de semi-finis ── */}
+                {expandedSubOfsId === order.id && (
+                  <View style={{ backgroundColor: '#F0F9FF', borderTopWidth: 1, borderTopColor: '#BAE6FD', paddingHorizontal: 20, paddingVertical: 12 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                      <Text style={{ fontSize: 12, fontWeight: '800', color: '#0891B2', letterSpacing: 0.5 }}>
+                        SOUS-OF SEMI-FINIS
+                      </Text>
+                      <TouchableOpacity
+                        onPress={() => handleOpenSubOfModal(order)}
+                        style={{ flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, backgroundColor: '#0891B2' }}
+                      >
+                        <MaterialCommunityIcons name="plus" size={13} color="#FFF" />
+                        <Text style={{ fontSize: 11, fontWeight: '700', color: '#FFF' }}>Nouveau SF</Text>
+                      </TouchableOpacity>
+                    </View>
+                    {(subOfsMap[order.id] || []).length === 0 ? (
+                      <Text style={{ fontSize: 13, color: '#ADB5BD', fontStyle: 'italic', paddingVertical: 8 }}>
+                        Aucun sous-OF de semi-fini créé.
+                      </Text>
+                    ) : (
+                      (subOfsMap[order.id] || []).map((subOf: any) => (
+                        <View key={subOf.id} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#BAE6FD', gap: 12 }}>
+                          <MaterialCommunityIcons name="sitemap" size={18} color="#0891B2" />
+                          <View style={{ flex: 1 }}>
+                            <Text style={{ fontSize: 12, fontWeight: '700', color: '#1A1A1A' }}>{subOf.code}</Text>
+                            <Text style={{ fontSize: 12, color: '#6C757D' }}>{subOf.product?.name}</Text>
+                            <Text style={{ fontSize: 11, color: '#ADB5BD', marginTop: 2 }}>
+                              {subOf.qty_planned} {subOf.product?.unit} · {subOf.status}
+                            </Text>
+                          </View>
+                          <Badge
+                            label={subOf.status}
+                            color={subOf.status === 'PLANIFIE' ? C.info : subOf.status === 'EN_COURS' ? C.gold : C.ok}
+                          />
+                        </View>
+                      ))
+                    )}
+                  </View>
+                )}
               </View>
             );
           }}
@@ -1599,6 +1918,55 @@ export function ProductionScreen() {
         onPageChange={(p) => setPage(p)}
         loading={loadingOrders}
       />
+
+      {/* ── Barre d'actions multi-sélection OF ── */}
+      {selectedOfIds.length > 0 && (
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            backgroundColor: '#1E40AF',
+            borderRadius: 10,
+            paddingHorizontal: 16,
+            paddingVertical: 10,
+            marginVertical: 10,
+            gap: 10,
+          }}
+        >
+          <MaterialCommunityIcons name="clipboard-list" size={18} color="#93C5FD" />
+          <Text style={{ color: '#FFF', fontWeight: '700', flex: 1, fontSize: 13 }}>
+            {selectedOfIds.length} OF sélectionné{selectedOfIds.length > 1 ? 's' : ''}
+          </Text>
+          <TouchableOpacity
+            onPress={() => {
+              const sel = filteredOrders.filter((o) => selectedOfIds.includes(o.id));
+              Alert.alert(
+                'OF sélectionnés',
+                sel.slice(0, 6).map((o) => `${o.code} · ${o.status} · ${o.qty_planned} ${o.product?.unit || ''}`).join('\n') +
+                (sel.length > 6 ? '\n...' : ''),
+              );
+            }}
+            style={{ backgroundColor: '#3B82F6', borderRadius: 6, paddingHorizontal: 10, paddingVertical: 6 }}
+          >
+            <Text style={{ color: '#FFF', fontSize: 12, fontWeight: '600' }}>Détail</Text>
+          </TouchableOpacity>
+          {(['ADMIN', 'SUPER_ADMIN', 'PLAN'] as string[]).includes(profile?.role ?? '') && (
+            <TouchableOpacity
+              onPress={handleDeleteSelectedOrders}
+              style={{ backgroundColor: '#DC2626', borderRadius: 6, paddingHorizontal: 10, paddingVertical: 6, flexDirection: 'row', alignItems: 'center', gap: 4 }}
+            >
+              <MaterialCommunityIcons name="trash-can-outline" size={14} color="#FFF" />
+              <Text style={{ color: '#FFF', fontSize: 12, fontWeight: '600' }}>Supprimer</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity
+            onPress={() => setSelectedOfIds([])}
+            style={{ backgroundColor: 'rgba(255,255,255,0.15)', borderRadius: 6, paddingHorizontal: 10, paddingVertical: 6 }}
+          >
+            <Text style={{ color: '#FFF', fontSize: 12 }}>✕ Effacer</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {whatIfResults.length > 0 && (
         <View style={s.resultsSection}>
@@ -1800,6 +2168,30 @@ export function ProductionScreen() {
             )}
           </View>
         </View>
+
+        {/* M3 : Filtre par gamme */}
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+          {GAMMES.map((g) => (
+            <TouchableOpacity
+              key={g || 'ALL'}
+              onPress={() => setBomGammeFilter(g)}
+              style={{
+                paddingHorizontal: 12, paddingVertical: 5, borderRadius: 20,
+                backgroundColor: bomGammeFilter === g ? '#1E513B' : '#F1F5F9',
+                borderWidth: 1,
+                borderColor: bomGammeFilter === g ? '#1E513B' : '#E2E8F0',
+              }}
+            >
+              <Text style={{ fontSize: 12, fontWeight: '600', color: bomGammeFilter === g ? '#FFF' : '#475569' }}>
+                {g === '' ? 'Toutes gammes' : g}
+              </Text>
+            </TouchableOpacity>
+          ))}
+          <Text style={{ fontSize: 11, color: '#94A3B8', alignSelf: 'center', marginLeft: 4 }}>
+            {filteredBoms.length} nomenclature{filteredBoms.length > 1 ? 's' : ''}
+          </Text>
+        </View>
+
         {/* BOM — Tableau PC / Tablette */}
         {!isMobile && (
           <View style={s.bomTableWrap}>
@@ -2013,25 +2405,37 @@ export function ProductionScreen() {
               return list.map(p => ({ label: getProductName(p), value: p.id }));
             })()}
             onSelect={v => {
-              // Auto-sélectionner le BOM VALIDE du produit choisi
-              const matchingBom = filteredBoms.find(
+              // Auto-sélectionner le BOM VALIDE du produit choisi — cherche dans TOUS les boms sans filtre gamme
+              const matchingBom = boms.find(
                 (b: BomHeader) => b.product_id === v && b.status === 'VALIDE'
-              ) ?? filteredBoms.find((b: BomHeader) => b.product_id === v);
+              ) ?? boms.find((b: BomHeader) => b.product_id === v);
               setOfFormData({
                 ...ofFormData,
                 product_id: v,
-                bom_header_id: matchingBom?.id ?? ofFormData.bom_header_id,
+                bom_header_id: matchingBom?.id ?? null,
               });
             }}
             searchable
           />
         </View>
-        <FormSelect
-          label="Nomenclature (BOM)"
-          value={ofFormData.bom_header_id ?? ''}
-          options={filteredBoms.map(b => ({ label: `${b.code} (v${b.version})`, value: b.id }))}
-          onSelect={v => setOfFormData({ ...ofFormData, bom_header_id: v })}
-        />
+        {/* BOM : seulement les BOMs du produit sélectionné */}
+        {(() => {
+          const productBoms = ofFormData.product_id
+            ? boms.filter((b: BomHeader) => b.product_id === ofFormData.product_id)
+            : filteredBoms;
+          const autoSelected = productBoms.length === 1;
+          return (
+            <FormSelect
+              label={`Nomenclature (BOM)${autoSelected ? ' — sélectionné automatiquement' : ''}`}
+              value={ofFormData.bom_header_id ?? ''}
+              options={productBoms.map(b => ({
+                label: `${b.code} v${b.version}${b.status === 'VALIDE' ? ' ✓' : ''}`,
+                value: b.id,
+              }))}
+              onSelect={v => setOfFormData({ ...ofFormData, bom_header_id: v })}
+            />
+          );
+        })()}
         <FormInput label="Quantité planifiée" value={String(ofFormData.qty_planned ?? '')} onChangeText={val => setOfFormData({ ...ofFormData, qty_planned: val as any })} keyboardType="numeric" />
         <FormDatePicker label="Date planifiée" value={ofFormData.planned_date ?? ''} onChangeDate={t => setOfFormData({ ...ofFormData, planned_date: t })} />
       </FormModal>
@@ -2197,6 +2601,28 @@ export function ProductionScreen() {
             ))}
           </View>
         </View>
+        <FormSelect
+          label=""
+          value={whatIfFormData.product_id ?? ''}
+          options={(() => {
+            let list = filteredProducts;
+            if (whatIfCategory) {
+              list = list.filter(p => getProductName(p).toLowerCase().includes(whatIfCategory.toLowerCase()));
+            }
+            return list.map(p => ({ label: getProductName(p), value: p.id }));
+          })()}
+          onSelect={v => {
+            const selectedProduct = filteredProducts.find(p => p.id === v);
+            const units = selectedProduct?.colisage ? String(selectedProduct.colisage) : '';
+            // Si on a déjà un nombre de cartons saisi, on recalcule la quantité totale
+            const cartonsNum = whatIfFormData.cartons ? parseFloat(whatIfFormData.cartons) : 0;
+            const unitsNum = units ? parseFloat(units) : 0;
+            const newQty = (cartonsNum > 0 && unitsNum > 0) ? String(cartonsNum * unitsNum) : whatIfFormData.qty;
+            
+            setWhatIfFormData({ ...whatIfFormData, product_id: v, units_per_carton: units, qty: newQty });
+          }}
+          searchable
+        />
         <FormInput
           label="Quantité par Carton (unités)"
           value={whatIfFormData.units_per_carton || ''}
@@ -2224,19 +2650,6 @@ export function ProductionScreen() {
           value={whatIfFormData.qty || ''}
           onChangeText={val => setWhatIfFormData({ ...whatIfFormData, qty: val, cartons: '', units_per_carton: '' })}
           keyboardType="numeric"
-        />
-        <FormSelect
-          label=""
-          value={whatIfFormData.product_id ?? ''}
-          options={(() => {
-            let list = filteredProducts;
-            if (whatIfCategory) {
-              list = list.filter(p => getProductName(p).toLowerCase().includes(whatIfCategory.toLowerCase()));
-            }
-            return list.map(p => ({ label: getProductName(p), value: p.id }));
-          })()}
-          onSelect={v => setWhatIfFormData({ ...whatIfFormData, product_id: v })}
-          searchable
         />
         <FormSelect
           label={t('mois_prevision')}
@@ -2336,6 +2749,177 @@ export function ProductionScreen() {
           placeholder="YYYY-MM-DDTHH:MM"
         />
       </FormModal>
+
+      {/* M3 ── Modal : Créer un sous-OF de semi-fini ── */}
+      <FormModal
+        visible={subOfModalVisible}
+        title={`Sous-OF Semi-Fini — lié à ${subOfParent?.code || ''}`}
+        onClose={() => setSubOfModalVisible(false)}
+        onSave={handleSaveSubOf}
+        loading={false}
+      >
+        <View style={{ padding: 12, backgroundColor: '#E0F2FE', borderRadius: 8, borderWidth: 1, borderColor: '#0891B2', marginBottom: 16, flexDirection: 'row', alignItems: 'flex-start', gap: 10 }}>
+          <MaterialCommunityIcons name="information-outline" size={18} color="#0891B2" style={{ marginTop: 1 }} />
+          <Text style={{ fontSize: 13, color: '#0891B2', fontWeight: '600', flex: 1 }}>
+            Créez un sous-OF pour fabriquer un semi-fini (colorant, soude diluée, mélange intermédiaire) nécessaire à l'OF principal.
+          </Text>
+        </View>
+        <FormInput label="Code Sous-OF" value={subOfFormData.code ?? ''} editable={false} style={{ backgroundColor: '#F1F3F5', color: '#6C757D' }} />
+        <View style={{ marginBottom: 4 }}>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: '#374151', marginBottom: 6 }}>Semi-fini à produire</Text>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+            {(['', 'Savon', 'Bougie', 'Encaustique', 'PH', 'Corde'] as const).map((cat) => (
+              <TouchableOpacity
+                key={cat}
+                onPress={() => setSubOfCategory(cat)}
+                style={{ paddingHorizontal: 10, paddingVertical: 4, borderRadius: 16, backgroundColor: subOfCategory === cat ? '#0891B2' : '#F1F5F9', borderWidth: 1, borderColor: subOfCategory === cat ? '#0891B2' : '#E2E8F0' }}
+              >
+                <Text style={{ fontSize: 11, fontWeight: '600', color: subOfCategory === cat ? '#FFF' : '#475569' }}>
+                  {cat === '' ? 'Tous' : cat}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          <FormSelect
+            label="Semi-fini (SF)"
+            value={subOfFormData.product_id ?? ''}
+            options={sfWithBom
+              .filter(sf => !subOfCategory || sf.name.toLowerCase().includes(subOfCategory.toLowerCase()))
+              .map(sf => ({ label: `[SF] ${sf.name}`, value: sf.id }))}
+            onSelect={v => {
+              const matchingBom = boms.find((b: any) => b.product_id === v && b.status === 'VALIDE') ?? boms.find((b: any) => b.product_id === v);
+              setSubOfFormData({ ...subOfFormData, product_id: v, bom_header_id: matchingBom?.id });
+            }}
+            searchable
+          />
+        </View>
+        <FormSelect
+          label="Nomenclature SF (BOM)"
+          value={subOfFormData.bom_header_id ?? ''}
+          options={boms.filter((b: any) => b.product_id === subOfFormData.product_id).map((b: any) => ({ label: `${b.code} (v${b.version})`, value: b.id }))}
+          onSelect={v => setSubOfFormData({ ...subOfFormData, bom_header_id: v })}
+        />
+        <FormInput
+          label="Quantité à produire"
+          value={String(subOfFormData.qty_planned ?? '')}
+          onChangeText={val => setSubOfFormData({ ...subOfFormData, qty_planned: val as any })}
+          keyboardType="numeric"
+        />
+        <FormDatePicker
+          label="Date planifiée"
+          value={subOfFormData.planned_date ?? ''}
+          onChangeDate={t => setSubOfFormData({ ...subOfFormData, planned_date: t })}
+        />
+      </FormModal>
+
+      {/* M3 ── Modal : Enregistrer consommations MP ── */}
+      <Modal
+        visible={mpConsoModalVisible}
+        animationType="fade"
+        transparent
+        onRequestClose={() => { if (!mpConsoLoading) setMpConsoModalVisible(false); }}
+      >
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'center', alignItems: 'center', padding: 20 }}>
+          <View style={{ backgroundColor: '#FFF', borderRadius: 16, width: '100%', maxWidth: 560, padding: 24, gap: 16, maxHeight: '85%' }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <View>
+                <Text style={{ fontSize: 16, fontWeight: '800', color: '#111827' }}>Consommations MP</Text>
+                <Text style={{ fontSize: 12, color: '#9CA3AF' }}>OF : {mpConsoTargetOf?.code}</Text>
+              </View>
+              <TouchableOpacity onPress={() => setMpConsoModalVisible(false)} style={{ padding: 6, borderRadius: 8, backgroundColor: '#F3F4F6', opacity: mpConsoLoading ? 0.4 : 1 }}>
+                <MaterialCommunityIcons name="close" size={20} color="#6B7280" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={{ padding: 12, backgroundColor: '#F0FDF4', borderRadius: 8, borderWidth: 1, borderColor: '#86EFAC' }}>
+              <Text style={{ fontSize: 12, color: '#166534', fontWeight: '600' }}>
+                Sélectionnez les lots MP consommés et les quantités utilisées. Ces données alimentent la traçabilité BP → LO.
+              </Text>
+            </View>
+
+            <ScrollView style={{ maxHeight: 300 }}>
+              {mpConsoEntries.map((entry, idx) => {
+                const selectedLot = lots.find((l: any) => l.id === entry.lot_id);
+                return (
+                  <View key={idx} style={{ backgroundColor: '#F9FAFB', borderRadius: 10, padding: 12, marginBottom: 10, borderWidth: 1, borderColor: '#E5E7EB' }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: '#374151' }}>Ligne {idx + 1}</Text>
+                      {mpConsoEntries.length > 1 && (
+                        <TouchableOpacity onPress={() => handleRemoveMpConsoLine(idx)}>
+                          <MaterialCommunityIcons name="trash-can-outline" size={16} color="#EF4444" />
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                    <FormSelect
+                      label="Lot MP"
+                      value={entry.lot_id}
+                      options={lots
+                        .filter((l: any) => l.article?.article_type === 'MP' || l.article?.article_type === 'EMB')
+                        .map((l: any) => ({ label: `${l.code} — ${l.article?.name} (${l.qty_current} ${l.unit})`, value: l.id }))}
+                      onSelect={v => {
+                        const lot = lots.find((l: any) => l.id === v) as any;
+                        const updated = [...mpConsoEntries];
+                        updated[idx] = { ...updated[idx], lot_id: v, article_id: lot?.article_id || lot?.article?.id || '', unit: lot?.unit || 'kg' };
+                        setMpConsoEntries(updated);
+                      }}
+                      searchable
+                    />
+                    {selectedLot && (
+                      <Text style={{ fontSize: 11, color: '#6B7280', marginBottom: 6, marginTop: -4 }}>
+                        Stock disponible : {(selectedLot as any).qty_current} {(selectedLot as any).unit}
+                      </Text>
+                    )}
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      <View style={{ flex: 2 }}>
+                        <FormInput
+                          label="Quantité consommée"
+                          value={entry.qty}
+                          onChangeText={v => { const u = [...mpConsoEntries]; u[idx] = { ...u[idx], qty: v }; setMpConsoEntries(u); }}
+                          keyboardType="numeric"
+                          placeholder="ex: 250"
+                        />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <FormSelect
+                          label="Unité"
+                          value={entry.unit}
+                          options={[{ label: 'kg', value: 'kg' }, { label: 'L', value: 'L' }, { label: 'g', value: 'g' }, { label: 'unité', value: 'unité' }]}
+                          onSelect={v => { const u = [...mpConsoEntries]; u[idx] = { ...u[idx], unit: v }; setMpConsoEntries(u); }}
+                        />
+                      </View>
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+
+            <TouchableOpacity
+              onPress={handleAddMpConsoLine}
+              style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, borderWidth: 1.5, borderColor: '#6366F1', borderStyle: 'dashed', justifyContent: 'center' }}
+            >
+              <MaterialCommunityIcons name="plus" size={16} color="#6366F1" />
+              <Text style={{ fontSize: 13, fontWeight: '600', color: '#6366F1' }}>Ajouter un lot MP</Text>
+            </TouchableOpacity>
+
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <TouchableOpacity
+                style={{ flex: 1, padding: 12, borderRadius: 10, backgroundColor: '#F3F4F6', alignItems: 'center' }}
+                onPress={() => setMpConsoModalVisible(false)}
+              >
+                <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151' }}>Annuler</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={{ flex: 2, flexDirection: 'row', padding: 12, borderRadius: 10, backgroundColor: '#6366F1', alignItems: 'center', justifyContent: 'center', gap: 8, opacity: mpConsoLoading ? 0.6 : 1 }}
+                onPress={handleSaveMpConso}
+                disabled={mpConsoLoading}
+              >
+                {mpConsoLoading ? <ActivityIndicator size="small" color="#FFF" /> : <MaterialCommunityIcons name="check-bold" size={16} color="#FFF" />}
+                <Text style={{ fontSize: 14, fontWeight: '700', color: '#FFF' }}>Enregistrer les consommations</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* ── Modal Import BOM Excel ─────────────────────────────────────────── */}
       <Modal

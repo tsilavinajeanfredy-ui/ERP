@@ -445,6 +445,7 @@ export function AdminUsersScreen() {
 
   const isCard = width < 640;
   const isCompact = width >= 640 && width < 1024;
+  const tableNeedsScroll = isCompact || width < 900;
 
   // ── Mobile Card ────────────────────────────────────────────────────────────
   const renderCard = ({ item, index }: { item: any; index: number }) => {
@@ -736,23 +737,29 @@ export function AdminUsersScreen() {
           </View>
         ) : (
           /* ── TABLETTE / DESKTOP : table full width ── */
-          <View style={styles.tableCard}>
-            {renderTableHeader()}
-            {filteredUsers.length === 0 ? (
-              <View style={styles.emptyState}>
-                <MaterialCommunityIcons name="account-off-outline" size={52} color="#D1D5DB" />
-                <Text style={styles.emptyTitle}>Aucun utilisateur trouvé</Text>
-                <Text style={styles.emptySubtitle}>Modifiez les filtres ou ajoutez un utilisateur</Text>
-              </View>
-            ) : (
-              <FlatList
-                data={filteredUsers}
-                renderItem={renderTableRow}
-                keyExtractor={(item) => item.id}
-                scrollEnabled={false}
-              />
-            )}
-          </View>
+          <ScrollView
+            horizontal={tableNeedsScroll}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={tableNeedsScroll ? { minWidth: 760 } : undefined}
+          >
+            <View style={styles.tableCard}>
+              {renderTableHeader()}
+              {filteredUsers.length === 0 ? (
+                <View style={styles.emptyState}>
+                  <MaterialCommunityIcons name="account-off-outline" size={52} color="#D1D5DB" />
+                  <Text style={styles.emptyTitle}>Aucun utilisateur trouvé</Text>
+                  <Text style={styles.emptySubtitle}>Modifiez les filtres ou ajoutez un utilisateur</Text>
+                </View>
+              ) : (
+                <FlatList
+                  data={filteredUsers}
+                  renderItem={renderTableRow}
+                  keyExtractor={(item) => item.id}
+                  scrollEnabled={false}
+                />
+              )}
+            </View>
+          </ScrollView>
         )}
 
         {/* ── Pagination ────────────────────────────────────────────── */}

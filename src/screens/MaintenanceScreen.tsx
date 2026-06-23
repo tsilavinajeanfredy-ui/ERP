@@ -1,7 +1,16 @@
 import * as React from 'react';
-import { ScrollView, StyleSheet, Text, View, TouchableOpacity, ActivityIndicator, Alert, useWindowDimensions } from 'react-native';
+import { ScrollView, StyleSheet, Text, View, TouchableOpacity, ActivityIndicator, Alert, useWindowDimensions, Platform } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { C, KpiCard, AnimatedPage, Badge, ActionButton, FormModal, FormInput, FormSelect } from '../components/Ui';
+import { C, KpiCard, AnimatedPage, Badge, ActionButton, FormModal, FormInput, FormSelect, confirmShow } from '../components/Ui';
+
+// Sur web, Alert.alert n'affiche rien — on utilise confirmShow (ConfirmDialog) à la place
+function showAlert(title: string, message: string, onOk?: () => void) {
+  if (Platform.OS === 'web') {
+    confirmShow(title, message, onOk ?? (() => {}), undefined, false);
+  } else {
+    Alert.alert(title, message, onOk ? [{ text: 'OK', onPress: onOk }] : undefined);
+  }
+}
 import { useMaintenanceTasks } from '../lib/hooks';
 import { useTranslation } from '../lib/i18n';
 import { supabase } from '../lib/supabase';
@@ -118,7 +127,7 @@ export function MaintenanceScreen() {
     if (!selectedTask) return;
     const allChecked = Object.values(checklist).every(v => v);
     if (!allChecked) {
-      Alert.alert('Checklist incomplète', 'Veuillez valider toutes les étapes de maintenance préventive avant de certifier l\'intervention.');
+      showAlert('Checklist incomplète', 'Veuillez valider toutes les étapes de maintenance préventive avant de certifier l\'intervention.');
       return;
     }
 
@@ -141,11 +150,14 @@ export function MaintenanceScreen() {
 
       if (error) throw error;
 
-      Alert.alert('Intervention Validée', `Maintenance préventive complétée pour ${selectedTask.equipment_name}. Prochaine échéance planifiée au ${nextDue.toLocaleDateString('fr-FR')}.`);
+      showAlert('Intervention Validée', `Maintenance préventive complétée pour ${selectedTask.equipment_name}. Prochaine échéance planifiée au ${nextDue.toLocaleDateString('fr-FR')}.`, () => {
+        queryClient.invalidateQueries({ queryKey: ['maintenance_calendar_view'] });
+        setSelectedTask(null);
+      });
       queryClient.invalidateQueries({ queryKey: ['maintenance_calendar_view'] });
       setSelectedTask(null);
     } catch (err: any) {
-      Alert.alert('Erreur', err.message || 'Impossible d\'enregistrer l\'intervention');
+      showAlert('Erreur', err.message || "Impossible d'enregistrer l'intervention");
     } finally {
       setCompletingTask(false);
     }
@@ -154,7 +166,7 @@ export function MaintenanceScreen() {
   const handleSendSos = async () => {
     const finalEquipmentName = isCustomEquipment ? customEquipmentName.trim() : sosData.equipment_name;
     if (!finalEquipmentName || !sosData.description) {
-      Alert.alert('Champs obligatoires', 'Veuillez saisir le nom de l\'équipement en panne et la description du défaut.');
+      showAlert('Champs obligatoires', "Veuillez saisir le nom de l'équipement en panne et la description du défaut.");
       return;
     }
 
@@ -194,14 +206,14 @@ export function MaintenanceScreen() {
         ]);
       } catch (_) { /* notifications non bloquantes */ }
 
-      Alert.alert('🚨 SOS Transmis', `Panne signalée pour : ${finalEquipmentName}\n\nL'équipe de maintenance curative a été alertée.`);
+      showAlert('🚨 SOS Transmis', `Panne signalée pour : ${finalEquipmentName}\n\nL'équipe de maintenance curative a été alertée.`);
       queryClient.invalidateQueries({ queryKey: ['maintenance_calendar_view'] });
       setSosModalVisible(false);
       setSosData({ equipment_name: '', equipment_type: 'PRODUCTION', description: '', priority: 'CRITIQUE' });
       setIsCustomEquipment(false);
       setCustomEquipmentName('');
     } catch (err: any) {
-      Alert.alert('Erreur', err.message || 'Impossible de signaler la panne');
+      showAlert('Erreur', err.message || 'Impossible de signaler la panne');
     } finally {
       setSavingSos(false);
     }
@@ -245,10 +257,10 @@ export function MaintenanceScreen() {
               <View style={s.tableCard}>
                 <View style={[s.tr, { backgroundColor: '#F8F9FA', borderBottomWidth: 2, borderBottomColor: '#E9ECEF' }]}>
                   <Text style={[s.th, { flex: 1.5 }]}>Équipement</Text>
-                  <Text style={[s.th, { flex: 1 }]}>{t('maintenance_frequency')}</Text>
-                  <Text style={[s.th, { flex: 1 }]}>{t('maintenance_next')}</Text>
-                  <Text style={[s.th, { flex: 0.7, textAlign: 'right' }]}>{t('maintenance_priority')}</Text>
-                  <Text style={[s.th, { flex: 0.7, textAlign: 'right' }]}>{t('maintenance_urgency')}</Text>
+                  <Text style={[s.th, { flex: 1, textAlign: 'left' }]}>{t('maintenance_frequency')}</Text>
+                  <Text style={[s.th, { flex: 1, textAlign: 'left' }]}>{t('maintenance_next')}</Text>
+                  <Text style={[s.th, { flex: 0.7, textAlign: 'left' }]}>{t('maintenance_priority')}</Text>
+                  <Text style={[s.th, { flex: 0.7, textAlign: 'left' }]}>{t('maintenance_urgency')}</Text>
                 </View>
                 {[...overdue, ...dueSoon, ...tasks.filter((t: any) => t.urgency === 'DANS_TEMPS' || t.urgency === 'PLANIFIE')].map((t: any, idx: number) => {
                   const isSelected = selectedTask?.id === t.id;
@@ -262,12 +274,12 @@ export function MaintenanceScreen() {
                         <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>{t.equipment_name}</Text>
                         <Text style={{ fontSize: 11, color: '#6C757D' }}>{t.code} · {t.equipment_type || '—'}</Text>
                       </View>
-                      <Text style={[s.td, { flex: 1 }]}>{t.frequency_days === 0 ? 'SOS Panne' : `${t.frequency_days}j`}</Text>
-                      <Text style={[s.td, { flex: 1 }]}>{t.next_due_at ? new Date(t.next_due_at).toLocaleDateString('fr-FR') : '—'}</Text>
-                      <View style={{ flex: 0.7, alignItems: 'flex-end' }}>
+                      <Text style={[s.td, { flex: 1, textAlign: 'left' }]}>{t.frequency_days === 0 ? 'SOS Panne' : `${t.frequency_days}j`}</Text>
+                      <Text style={[s.td, { flex: 1, textAlign: 'left' }]}>{t.next_due_at ? new Date(t.next_due_at).toLocaleDateString('fr-FR') : '—'}</Text>
+                      <View style={{ flex: 0.7, alignItems: 'flex-start', justifyContent: 'center' }}>
                         <Badge label={t.priority} color={PRIORITY_COLORS[t.priority] || '#ADB5BD'} />
                       </View>
-                      <View style={{ flex: 0.7, alignItems: 'flex-end' }}>
+                      <View style={{ flex: 0.7, alignItems: 'flex-start', justifyContent: 'center' }}>
                         <Badge label={t.urgency} color={URGENCY_COLORS[t.urgency] || '#ADB5BD'} />
                       </View>
                     </TouchableOpacity>

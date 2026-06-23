@@ -7,7 +7,8 @@ export type CqlibStatus = 'EN_ATTENTE' | 'QUARANTAINE' | 'LIBERE' | 'BLOQUE' | '
 export type FcqStatus = 'EN_ATTENTE' | 'EN_COURS' | 'COMPLET' | 'VALIDE';
 export type FncSeverity = 'MINEURE' | 'MAJEURE' | 'CRITIQUE';
 export type FncStatus = 'OUVERTE' | 'EN_COURS' | 'A_VALIDER' | 'CLOTUREE';
-export type DaImportStep = 'DA_VALIDEE' | 'PROFORMA' | 'LC_VIREMENT' | 'EXPEDITION' | 'CONNAISSEMENT' | 'DEDOUANEMENT' | 'ETA' | 'RECEPTION';
+export type FncDecisionType = 'BLOQUE' | 'DETERIORE' | 'RETOUR' | 'TRI' | 'REWORK';
+export type DaImportStep = 'DA_VALIDEE' | 'PROFORMA' | 'LC_VIREMENT' | 'EXPEDITION' | 'CONNAISSEMENT' | 'DEDOUANEMENT' | 'ETA' | 'ARRIVEE_TAMATAVE' | 'ARRIVEE_USINE' | 'RECEPTION';
 export type DaLocalStep = 'SAISIE' | 'VALIDATION' | 'COMMANDE' | 'RECEPTION';
 export type DaStatus = 'EN_COURS' | 'RETARD' | 'LIVRE' | 'CLOS' | 'ANNULE';
 export type InstrumentStatus = 'ETALONNE' | 'A_ETALONNER' | 'ECHU' | 'EN_ATTENTE';
@@ -49,6 +50,8 @@ export interface User {
   avatar_url: string | null;
   active: boolean;
   two_fa_enabled: boolean;
+  push_token: string | null;
+  push_token_updated_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -118,6 +121,8 @@ export interface Article {
   default_depot_id: string | null;
   safety_stock: number;
   reorder_point: number;
+  shelf_life_days?: number | null;
+  colisage?: number;
   cqlib_exempt: boolean;
   exemption_reason: string | null;
   sage_code: string | null;
@@ -220,6 +225,18 @@ export interface Fnc {
   d8_closure_notes: string | null;
   d8_signature: string | null;
 
+  // Décision qualité typée (M5) + workflow associé
+  decision_type?: FncDecisionType | null;
+  decision_notes?: string | null;
+  decision_at?: string | null;
+  decision_by?: string | null;
+
+  // Vérification d'efficacité avant clôture (M5)
+  efficacy_checked?: boolean | null;
+  efficacy_notes?: string | null;
+  efficacy_checked_at?: string | null;
+  efficacy_checked_by?: string | null;
+
   assigned_to?: string | null;
   created_by?: string | null;
   opened_by: string | null;
@@ -250,6 +267,9 @@ export interface DaImport {
   status: DaStatus;
   eta_date: string | null;
   lead_time_days: number | null;
+  date_arrivee_tamatave?: string | null;
+  date_arrivee_usine?: string | null;
+  partial_receptions?: any[];
   requested_by: string | null;
   notes: string | null;
   documents?: any[];
@@ -321,6 +341,61 @@ export interface InventoryCount {
   created_at: string;
 }
 
+export interface ManagementReview {
+  id: string;
+  period_month: string;
+  status: string;
+  kpis: Record<string, any>;
+  notes: string | null;
+  generated_at: string;
+  validated_by: string | null;
+  validated_at: string | null;
+}
+
+export interface UserDashboardPreferences {
+  user_id: string;
+  hidden_sections: string[];
+  favorites: string[];
+  layout: Record<string, unknown> | null;
+  updated_at: string;
+}
+
+export interface ProductDatasheet {
+  id: string;
+  article_id: string;
+  version: number;
+  status: string;
+  family: string | null;
+  commercial_name: string | null;
+  description: string | null;
+  quality_specs: string | null;
+  physical_specs: string | null;
+  packaging: string | null;
+  storage_conditions: string | null;
+  shelf_life: string | null;
+  usage_instructions: string | null;
+  regulatory: string | null;
+  validated_by: string | null;
+  validated_at: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InventorySheet {
+  id: string;
+  campaign_id: string;
+  sheet_number: number;
+  article_id: string | null;
+  depot_id: string | null;
+  zone_label: string | null;
+  qty_theoretical: number | null;
+  status: string;
+  assigned_to: string | null;
+  printed_at: string | null;
+  created_at: string;
+}
+
 export interface BomHeader {
   id: string;
   code: string;
@@ -360,6 +435,11 @@ export interface Complaint {
   preventive_action: string | null;
   compensation: string | null;
   fnc_id: string | null;
+  fcq_id?: string | null;
+  // Circuit J+1 & escalade (M5)
+  due_by?: string | null;
+  escalated_at?: string | null;
+  escalation_level?: number | null;
   opened_by: string | null;
   closed_by: string | null;
   opened_at: string;
@@ -399,6 +479,15 @@ export interface SupplierEvaluation {
   evaluated_by: string | null;
   evaluated_at: string;
   created_at: string;
+}
+
+export interface SupplierEvalWeight {
+  criteria: EvalCriteria;
+  label: string;
+  weight: number;
+  active: boolean;
+  sort_order: number;
+  updated_at: string;
 }
 
 export interface SupplierEvaluationSummary {
@@ -442,6 +531,19 @@ export interface InventoryEcartView {
   notes: string | null;
   campaign_status: string;
   reconciliation_status: ReconciliationStatus;
+}
+
+export interface FinalStockView {
+  article_id: string;
+  article_code: string;
+  article_name: string;
+  article_type: ArticleType;
+  unit: string;
+  depot_id: string;
+  depot_code: string;
+  depot_name: string;
+  qty_final: number;
+  lot_count: number;
 }
 
 export interface LotGenealogyView {

@@ -57,7 +57,7 @@ export function TwoFactorScreen({ onVerify, onSignOut, userEmail, userName }: Tw
       }
       // ✅ factors.totp retourne les TOTP vérifiés même en session AAL1
       // factors.all peut être vide en AAL1, c'est pourquoi on utilisait mal factors.all avant
-      const verifiedFactor = factors?.totp?.find(f => f.status === 'verified');
+      const verifiedFactor = factors?.totp?.find((f: any) => f.status === 'verified');
 
       if (verifiedFactor) {
         setMfaFactorId(verifiedFactor.id);
@@ -67,8 +67,8 @@ export function TwoFactorScreen({ onVerify, onSignOut, userEmail, userName }: Tw
       }
 
       // Aucun vérifié — chercher un unverified récent (< 10 min) à réutiliser
-      const unverified = factors?.all?.filter(f => f.status === 'unverified') ?? [];
-      const recentUnverified = unverified.find(f => {
+      const unverified = factors?.all?.filter((f: any) => f.status === 'unverified') ?? [];
+      const recentUnverified = unverified.find((f: any) => {
         const age = Date.now() - new Date(f.created_at).getTime();
         return age < 10 * 60 * 1000; // moins de 10 minutes
       });

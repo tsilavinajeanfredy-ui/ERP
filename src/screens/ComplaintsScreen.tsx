@@ -2,7 +2,7 @@ import * as React from 'react';
 import { ScrollView, StyleSheet, Text, View, ActivityIndicator, useWindowDimensions, Alert } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { C, KpiCard, ActionButton, Badge, AnimatedPage, FormModal, FormInput, FormSelect, SectionTitle, DataTable, PaginationControls } from '../components/Ui';
-import { useComplaints, useLots, useUserProfile, useMutation, useNotification } from '../lib/hooks';
+import { useComplaints, useLots, useFcqDossiers, useUserProfile, useMutation, useNotification } from '../lib/hooks';
 import { useTranslation } from '../lib/i18n';
 import { useSearch } from '../lib/search';
 import { generatePdf, getPdfTemplate } from '../lib/pdf';
@@ -20,6 +20,18 @@ const SEVERITY_MAP: Record<string, { label: string; color: string }> = {
   CRITIQUE: { label: 'Critique', color: C.err },
 };
 
+const ESCALATION_MAP: Record<number, { label: string; color: string }> = {
+  0: { label: 'Aucune', color: C.textMuted },
+  1: { label: 'Niveau 1 — RQ', color: C.gold },
+  2: { label: 'Niveau 2 — DPI', color: C.err },
+  3: { label: 'Niveau 3 — Direction', color: C.err },
+};
+
+/** Une réclamation non clôturée dont l'échéance (J+1) est dépassée est en retard. */
+function isOverdue(c: { status: string; due_by?: string | null }): boolean {
+  return c.status !== 'CLOTUREE' && !!c.due_by && new Date(c.due_by).getTime() < Date.now();
+}
+
 export function ComplaintsScreen() {
   const { width } = useWindowDimensions();
   const isMobile = width < 992;
@@ -32,6 +44,7 @@ export function ComplaintsScreen() {
   const { t } = useTranslation();
   const { data: complaints = [], count: complaintsCount, isPending: loading } = useComplaints(page, limit);
   const { data: lots = [] } = useLots(0, 100);
+  const { data: fcqDossiers = [] } = useFcqDossiers(0, 100);
 
   const [selId, setSelId] = React.useState<string | null>(null);
   const [modalVisible, setModalVisible] = React.useState(false);
@@ -51,6 +64,7 @@ export function ComplaintsScreen() {
   const openCount = complaints.filter(c => c.status === 'OUVERTE').length;
   const analysisCount = complaints.filter(c => c.status === 'EN_ANALYSE').length;
   const closedCount = complaints.filter(c => c.status === 'CLOTUREE').length;
+  const overdueCount = complaints.filter(c => isOverdue(c)).length;
 
   const handleAdd = () => {
     const year = new Date().getFullYear();
@@ -89,6 +103,24 @@ export function ComplaintsScreen() {
         ...(newStatus === 'CLOTUREE' ? { closed_at: new Date().toISOString(), closed_by: profile?.id } : {}),
       },
       type: 'UPDATE',
+    });
+  };
+
+  const handleEscalate = (c: any) => {
+    const nextLevel = Math.min((c.escalation_level || 0) + 1, 3);
+    const targetRole = nextLevel === 1 ? 'RQ' : nextLevel === 2 ? 'DPI' : 'ADMIN';
+    mutation.mutate({
+      id: c.id,
+      values: { escalation_level: nextLevel, escalated_at: new Date().toISOString() },
+      type: 'UPDATE',
+    });
+    notify.mutate({
+      to_role: targetRole,
+      subject: `[RÉCLAMATION] Escalade niveau ${nextLevel} — ${c.code}`,
+      message: `Réclamation ${c.code} (${c.client_name}, sévérité ${c.severity}) escaladée au niveau ${nextLevel}.`,
+      type: 'error',
+      category: 'QUALITY',
+      metadata: { category: 'QUALITY', screen: 'Complaints', complaint_id: c.id, escalation_level: nextLevel },
     });
   };
 
@@ -133,6 +165,7 @@ export function ComplaintsScreen() {
         <View style={[s.grid, isMobile && { flexDirection: 'column' }]}>
           <KpiCard label="Ouvertes" value={String(openCount)} sub="À traiter" color={C.err} />
           <KpiCard label="En analyse" value={String(analysisCount)} sub="En cours" color={C.info} />
+          <KpiCard label="En retard" value={String(overdueCount)} sub="Échéance J+1 dépassée" color={C.gold} />
           <KpiCard label="Clôturées" value={String(closedCount)} sub="Ce mois" color={C.ok} />
         </View>
 
@@ -156,8 +189,12 @@ export function ComplaintsScreen() {
                 { key: 'severity', label: 'Sévérité', flex: 0.7, render: (item: any) => (
                   <Badge label={item.severity} color={SEVERITY_MAP[item.severity]?.color || C.textMuted} />
                 )},
-                { key: 'status', label: 'Statut', flex: 0.7, render: (item: any) => (
-                  <Badge label={STATUS_MAP[item.status]?.label || item.status} color={STATUS_MAP[item.status]?.color || C.textMuted} />
+                { key: 'status', label: 'Statut', flex: 0.9, render: (item: any) => (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <Badge label={STATUS_MAP[item.status]?.label || item.status} color={STATUS_MAP[item.status]?.color || C.textMuted} />
+                    {isOverdue(item) && <Badge label="Retard" color={C.err} />}
+                    {(item.escalation_level || 0) > 0 && <Badge label={`N${item.escalation_level}`} color={C.gold} />}
+                  </View>
                 )},
                 { key: 'opened_at', label: 'Date', flex: 0.7, render: (item: any) => (
                   <Text style={s.tableCellText}>{new Date(item.opened_at).toLocaleDateString()}</Text>
@@ -207,6 +244,15 @@ export function ComplaintsScreen() {
           options={lots.map(l => ({ label: `${l.code} - ${l.article?.name || ''}`, value: l.id }))}
           onSelect={v => setFormData({ ...formData, lot_id: v })}
         />
+        <FormSelect
+          label="Dossier FCQ lié (traçabilité CQ-Lab)"
+          value={formData.fcq_id ?? ''}
+          options={fcqDossiers
+            .filter((f: any) => !formData.lot_id || f.lot_id === formData.lot_id)
+            .map((f: any) => ({ label: `${f.code} (${f.fcq_type})`, value: f.id }))}
+          onSelect={v => setFormData({ ...formData, fcq_id: v })}
+          searchable
+        />
         <FormInput label="Description *" value={formData.description ?? ''} onChangeText={val => setFormData({ ...formData, description: val })} multiline />
         <FormInput label="Qté concernée" value={formData.qty_concerned ?? ''} onChangeText={val => setFormData({ ...formData, qty_concerned: val })} keyboardType="numeric" />
       </FormModal>
@@ -230,9 +276,37 @@ export function ComplaintsScreen() {
                 <View style={s.detailRow}><Text style={s.detailLabel}>{t('severity')}:</Text><Badge label={c.severity} color={SEVERITY_MAP[c.severity]?.color || C.textMuted} /></View>
                 <View style={s.detailRow}><Text style={s.detailLabel}>{t('complaints_origin')}:</Text><Text style={s.detailValue}>{c.origin}</Text></View>
                 <View style={s.detailRow}><Text style={s.detailLabel}>{t('complaints_date')}:</Text><Text style={s.detailValue}>{new Date(c.opened_at).toLocaleDateString()}</Text></View>
+                {c.due_by ? (
+                  <View style={s.detailRow}>
+                    <Text style={s.detailLabel}>Échéance (J+1):</Text>
+                    <Text style={[s.detailValue, isOverdue(c) && { color: C.err }]}>
+                      {new Date(c.due_by).toLocaleString('fr-FR')}{isOverdue(c) ? ' — EN RETARD' : ''}
+                    </Text>
+                  </View>
+                ) : null}
+                <View style={s.detailRow}>
+                  <Text style={s.detailLabel}>Escalade:</Text>
+                  <Badge label={ESCALATION_MAP[c.escalation_level || 0]?.label || '—'} color={ESCALATION_MAP[c.escalation_level || 0]?.color || C.textMuted} />
+                </View>
+                {c.fcq_id ? (
+                  <View style={s.detailRow}>
+                    <Text style={s.detailLabel}>Dossier FCQ:</Text>
+                    <Text style={s.detailValue}>{fcqDossiers.find((f: any) => f.id === c.fcq_id)?.code || c.fcq_id}</Text>
+                  </View>
+                ) : null}
               </View>
               <View style={s.detailSection}>
                 <SectionTitle>ACTIONS</SectionTitle>
+                {c.status !== 'CLOTUREE' && (c.escalation_level || 0) < 3 && (
+                  <View style={{ marginBottom: 12 }}>
+                    <ActionButton
+                      label={isOverdue(c) ? `Escalader (retard) → niveau ${Math.min((c.escalation_level || 0) + 1, 3)}` : `Escalader → niveau ${Math.min((c.escalation_level || 0) + 1, 3)}`}
+                      icon="arrow-up-bold-circle-outline"
+                      variant={isOverdue(c) ? 'primary' : 'secondary'}
+                      onPress={() => handleEscalate(c)}
+                    />
+                  </View>
+                )}
                 {c.status === 'OUVERTE' && (
                   <ActionButton label="Passer en analyse" icon="magnify" onPress={() => handleStatusChange(c.id, 'EN_ANALYSE')} />
                 )}

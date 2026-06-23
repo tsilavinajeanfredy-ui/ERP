@@ -12,13 +12,8 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 
 import { AppShellHeader } from './src/components/AppShellHeader';
 import { SidebarContent } from './src/components/SidebarContent';
-import { DashboardScreen } from './src/screens/DashboardScreen';
-import { LaboratoryScreen } from './src/screens/LaboratoryScreen';
-import { ReceptionScreen } from './src/screens/ReceptionScreen';
-import { ProductionScreen } from './src/screens/ProductionScreen';
-import { StocksScreen } from './src/screens/StocksScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
-import { useUserProfile, useMutation } from './src/lib/hooks';
+import { useUserProfile, useMutation, useRealtimeSync } from './src/lib/hooks';
 import { supabase } from './src/lib/supabase';
 import { Session } from '@supabase/supabase-js';
 import { LanguageProvider, useTranslation } from './src/lib/i18n';
@@ -30,13 +25,17 @@ import { NotificationToastProvider } from './src/components/NotificationToast';
 import { ConfirmDialog } from './src/components/Ui';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { initMonitoring, setMonitoringUser, clearMonitoringUser } from './src/lib/monitoring';
-
-// Static imports for screens that must be bundled with the main bundle
-import { FncScreen } from './src/screens/FncScreen';
-import { AuditScreen } from './src/screens/AuditScreen';
-
+import { registerForPushNotificationsAsync, savePushTokenForUser } from './src/lib/notifications';
 
 // ─── Lazy-loaded screens — chargés à la première navigation ─────────────────
+// TOUS les screens sont lazy pour minimiser le bundle initial (~80KB vs ~840KB)
+const _LazyDashboardScreen = React.lazy(() => import('./src/screens/DashboardScreen').then(m => ({ default: m.DashboardScreen })));
+const _LazyLaboratoryScreen = React.lazy(() => import('./src/screens/LaboratoryScreen').then(m => ({ default: m.LaboratoryScreen })));
+const _LazyReceptionScreen = React.lazy(() => import('./src/screens/ReceptionScreen').then(m => ({ default: m.ReceptionScreen })));
+const _LazyProductionScreen = React.lazy(() => import('./src/screens/ProductionScreen').then(m => ({ default: m.ProductionScreen })));
+const _LazyStocksScreen = React.lazy(() => import('./src/screens/StocksScreen').then(m => ({ default: m.StocksScreen })));
+const _LazyFncScreen = React.lazy(() => import('./src/screens/FncScreen').then(m => ({ default: m.FncScreen })));
+const _LazyAuditScreen = React.lazy(() => import('./src/screens/AuditScreen').then(m => ({ default: m.AuditScreen })));
 const _LazyComplaintsScreen = React.lazy(() => import('./src/screens/ComplaintsScreen').then(m => ({ default: m.ComplaintsScreen })));
 const _LazyInventoryScreen = React.lazy(() => import('./src/screens/InventoryScreen').then(m => ({ default: m.InventoryScreen })));
 const _LazyPurchasingImportScreen = React.lazy(() => import('./src/screens/PurchasingImportScreen').then(m => ({ default: m.PurchasingImportScreen })));
@@ -60,6 +59,7 @@ const _LazySageSyncScreen = React.lazy(() => import('./src/screens/SageSyncScree
 const _LazyMetrologyScreen = React.lazy(() => import('./src/screens/MetrologyScreen').then(m => ({ default: m.MetrologyScreen })));
 const _LazyOfflineSyncScreen = React.lazy(() => import('./src/screens/OfflineSyncScreen').then(m => ({ default: m.OfflineSyncScreen })));
 const _LazyInstrumentsScreen = React.lazy(() => import('./src/screens/InstrumentsScreen').then(m => ({ default: m.InstrumentsScreen })));
+const _LazyCalibrationManagementScreen = React.lazy(() => import('./src/screens/CalibrationManagementScreen'));
 
 // ─── Wrapper Suspense pour les écrans lazy ────────────────────────────────────
 function LazyScreen({ component: Component }: { component: React.ComponentType<object> }) {
@@ -78,15 +78,20 @@ function LazyScreen({ component: Component }: { component: React.ComponentType<o
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      // staleTime: 0 par défaut — les hooks transactionnels (lots, FCQ, etc.)
-      // ont besoin de données fraîches. Chaque hook STATIC/SEMI_STATIC déclare
-      // son propre staleTime via CACHE_TIMES dans hooks.ts.
-      staleTime: 0,
+      // staleTime global à 30s : évite les requêtes en rafale à chaque focus/mount
+      // Les hooks transactionnels (lots, FCQ, bons_entree) surchargent avec staleTime: 0
+      staleTime: 30_000,
+      gcTime: 5 * 60_000, // Garde les données en cache 5 minutes
       retry: (failureCount, error: any) => {
         const msg = (error?.message || '').toLowerCase();
         if (msg.includes('does not exist') || msg.includes('relation')) return false;
         return failureCount < 2;
       },
+      // Pas de refetch au focus sur web : évite la tempête de requêtes
+      // quand 50-150 users changent d'onglet simultanément
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: true,
+      refetchOnMount: true,
     },
   },
 });
@@ -107,13 +112,18 @@ const WARNING_TIME = 60 * 1000; // 1 minute avant déconnexion
 
 
 // ─── Named lazy screen wrappers (required by React Navigation) ──────────────
-const LazyFncScreen = () => <FncScreen />;
+const LazyDashboardScreen = () => <LazyScreen component={_LazyDashboardScreen} />;
+const LazyLaboratoryScreen = () => <LazyScreen component={_LazyLaboratoryScreen} />;
+const LazyReceptionScreen = () => <LazyScreen component={_LazyReceptionScreen} />;
+const LazyProductionScreen = () => <LazyScreen component={_LazyProductionScreen} />;
+const LazyStocksScreen = () => <LazyScreen component={_LazyStocksScreen} />;
+const LazyFncScreen = () => <LazyScreen component={_LazyFncScreen} />;
 const LazyComplaintsScreen = () => <LazyScreen component={_LazyComplaintsScreen} />;
 const LazyInventoryScreen = () => <LazyScreen component={_LazyInventoryScreen} />;
 const LazyPurchasingImportScreen = () => <LazyScreen component={_LazyPurchasingImportScreen} />;
 const LazyPurchasingLocalScreen = () => <LazyScreen component={_LazyPurchasingLocalScreen} />;
 const LazyMrpScreen = () => <LazyScreen component={_LazyMrpScreen} />;
-const LazyAuditScreen = () => <AuditScreen />;
+const LazyAuditScreen = () => <LazyScreen component={_LazyAuditScreen} />;
 const LazyReferentialScreen = () => <LazyScreen component={_LazyReferentialScreen} />;
 const LazyAdminScreen = () => <LazyScreen component={_LazyAdminScreen} />;
 const LazyAdminUsersScreen = () => <LazyScreen component={_LazyAdminUsersScreen} />;
@@ -131,6 +141,7 @@ const LazySageSyncScreen = () => <LazyScreen component={_LazySageSyncScreen} />;
 const LazyMetrologyScreen = () => <LazyScreen component={_LazyMetrologyScreen} />;
 const LazyOfflineSyncScreen = () => <LazyScreen component={_LazyOfflineSyncScreen} />;
 const LazyInstrumentsScreen = () => <LazyScreen component={_LazyInstrumentsScreen} />;
+const LazyCalibrationManagementScreen = () => <LazyScreen component={_LazyCalibrationManagementScreen} />;
 
 function AppContent() {
   const { profile, loading: profileLoading } = useUserProfile();
@@ -142,7 +153,23 @@ function AppContent() {
       initMonitoring(profile.id, profile.email, profile.role);
     }
   }, [profile?.id]);
+
   const [session, setSession] = React.useState<Session | null>(null);
+
+  // Enregistrer pour les push notifications sur mobile
+  React.useEffect(() => {
+    if (session && profile?.id) {
+      registerForPushNotificationsAsync().then(token => {
+        if (token) {
+          console.log("Push token récupéré (pour alertes MRP/Stock) :", token);
+          savePushTokenForUser(profile.id, token);
+        }
+      });
+    }
+  }, [session, profile?.id]);
+
+  // Start global realtime sync to keep dropdowns and lists up-to-date
+  useRealtimeSync();
   const [loading, setLoading] = React.useState(true);
   const [showWarning, setShowWarning] = React.useState(false);
   const [secondsLeft, setSecondsLeft] = React.useState(60);
@@ -173,7 +200,7 @@ function AppContent() {
       setLoading(false);
       return;
     }
-    supabase.auth.getSession().then(({ data: { session }, error }) => {
+    supabase.auth.getSession().then(({ data: { session }, error }: { data: { session: any }; error: any }) => {
       if (error) {
         console.warn('[App] Refresh token invalide, déconnexion automatique.');
         // Force local signOut to clear corrupted localStorage without server call
@@ -197,7 +224,7 @@ function AppContent() {
       setLoading(false);
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event: any, session: any) => {
       if (event === 'SIGNED_IN') {
         // Nouvelle connexion : réinitialiser la vérification 2FA de session si c'est un autre utilisateur
         if (Platform.OS === 'web') {
@@ -212,16 +239,7 @@ function AppContent() {
           setIs2FAVerifiedForSession(false);
         }
         setSession(session);
-        
-        const hasShown = Platform.OS === 'web' 
-            ? sessionStorage.getItem('gsi_welcome_shown') === 'true'
-            : (global as any).gsiWelcomeShown === true;
-            
-        if (session && !hasShown) {
-          setShowWelcome(true);
-          if (Platform.OS === 'web') sessionStorage.setItem('gsi_welcome_shown', 'true');
-          else (global as any).gsiWelcomeShown = true;
-        }
+        // ⚠️ showWelcome différé après validation 2FA (voir onVerify callback).
       } else if (event === 'SIGNED_OUT') {
         setSession(null);
         setIs2FAVerifiedForSession(false);
@@ -322,15 +340,28 @@ function AppContent() {
   // Gestion des événements Web (Souris, Clavier, Scroll)
   React.useEffect(() => {
     if (isWeb && session) {
-      const events = ['mousedown', 'mousemove', 'keydown', 'scroll', 'touchstart'];
+      const events = ['mousedown', 'keydown', 'scroll', 'touchstart'];
+      // mousemove séparé avec throttle 5s pour ne pas spammer resetInactivityTimer
+      let mousemoveThrottle: ReturnType<typeof setTimeout> | null = null;
 
       const handleActivity = () => resetInactivityTimer();
+      const handleMouseMove = () => {
+        if (!mousemoveThrottle) {
+          mousemoveThrottle = setTimeout(() => {
+            resetInactivityTimer();
+            mousemoveThrottle = null;
+          }, 5000);
+        }
+      };
 
       events.forEach(event => window.addEventListener(event, handleActivity));
+      window.addEventListener('mousemove', handleMouseMove);
       resetInactivityTimer();
 
       return () => {
         events.forEach(event => window.removeEventListener(event, handleActivity));
+        window.removeEventListener('mousemove', handleMouseMove);
+        if (mousemoveThrottle) clearTimeout(mousemoveThrottle);
         if (timerRef.current) clearTimeout(timerRef.current);
         if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
         if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
@@ -380,6 +411,15 @@ function AppContent() {
           if (Platform.OS === 'web' && session) {
             sessionStorage.setItem('gsi_2fa_verified', 'true');
             sessionStorage.setItem('gsi_2fa_user', session.user.id);
+          }
+          // Afficher le message de bienvenue APRÈS validation 2FA
+          const hasShown2FA = Platform.OS === 'web'
+            ? sessionStorage.getItem('gsi_welcome_shown') === 'true'
+            : (global as any).gsiWelcomeShown === true;
+          if (!hasShown2FA) {
+            setShowWelcome(true);
+            if (Platform.OS === 'web') sessionStorage.setItem('gsi_welcome_shown', 'true');
+            else (global as any).gsiWelcomeShown = true;
           }
           // Si c'est la première fois (setup), activer définitivement la 2FA sur le compte
           if (profile && !profile.two_fa_enabled) {
@@ -444,11 +484,11 @@ function AppContent() {
               },
             }}
           >
-          <Drawer.Screen name="Dashboard" component={DashboardScreen} options={{ title: t('dashboard') }} />
-          <Drawer.Screen name="Reception" component={ReceptionScreen} options={{ title: t('reception') }} />
-          <Drawer.Screen name="Laboratory" component={LaboratoryScreen} options={{ title: t('laboratory') }} />
-          <Drawer.Screen name="Production" component={ProductionScreen} options={{ title: t('production') }} />
-          <Drawer.Screen name="Stocks" component={StocksScreen} options={{ title: t('stocks') }} />
+          <Drawer.Screen name="Dashboard" component={LazyDashboardScreen} options={{ title: t('dashboard') }} />
+          <Drawer.Screen name="Reception" component={LazyReceptionScreen} options={{ title: t('reception') }} />
+          <Drawer.Screen name="Laboratory" component={LazyLaboratoryScreen} options={{ title: t('laboratory') }} />
+          <Drawer.Screen name="Production" component={LazyProductionScreen} options={{ title: t('production') }} />
+          <Drawer.Screen name="Stocks" component={LazyStocksScreen} options={{ title: t('stocks') }} />
           <Drawer.Screen name="Inventory" component={LazyInventoryScreen} options={{ title: t('inventory') }} />
           <Drawer.Screen name="Mrp" component={LazyMrpScreen} options={{ title: t('mrp') }} />
           <Drawer.Screen name="Audit" component={LazyAuditScreen} options={{ title: t('audit') }} />
@@ -473,6 +513,7 @@ function AppContent() {
           <Drawer.Screen name="Maintenance" component={LazyMaintenanceScreen} options={{ title: 'Maintenance' }} />
           <Drawer.Screen name="Metrology" component={LazyMetrologyScreen} options={{ title: 'Métrologie CQ' }} />
           <Drawer.Screen name="Instruments" component={LazyInstrumentsScreen} options={{ title: 'Instruments' }} />
+          <Drawer.Screen name="CalibrationManagement" component={LazyCalibrationManagementScreen} options={{ title: 'Calendrier Étalonnage' }} />
           <Drawer.Screen name="OfflineSync" component={LazyOfflineSyncScreen} options={{ title: 'File de Synchro' }} />
         </Drawer.Navigator>
       </NavigationContainer>

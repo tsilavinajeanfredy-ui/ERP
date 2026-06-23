@@ -131,14 +131,14 @@ export async function calculateMRP(whatIfScenario?: {
 
     // ── Helpers stock / entrées ─────────────────────────────────────────────
     const getStock = (articleId: string): number =>
-      stockData?.filter(l => l.article_id === articleId)
-        .reduce((s, l) => s + (l.qty_current || 0), 0) ?? 0;
+      stockData?.filter((l: any) => l.article_id === articleId)
+        .reduce((s: number, l: any) => s + (l.qty_current || 0), 0) ?? 0;
 
     const getIncoming = (articleId: string): number =>
-      (daImportData?.filter(d => d.article_id === articleId)
-        .reduce((s, d) => s + (d.qty_kg || 0), 0) ?? 0) +
-      (daLocalData?.filter(d => d.article_id === articleId)
-        .reduce((s, d) => s + (d.qty || 0), 0) ?? 0);
+      (daImportData?.filter((d: any) => d.article_id === articleId)
+        .reduce((s: number, d: any) => s + (d.qty_kg || 0), 0) ?? 0) +
+      (daLocalData?.filter((d: any) => d.article_id === articleId)
+        .reduce((s: number, d: any) => s + (d.qty || 0), 0) ?? 0);
 
     // ── Phase 1 : Besoins bruts en Produits Finis ───────────────────────────
     //

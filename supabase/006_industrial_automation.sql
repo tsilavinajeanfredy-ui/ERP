@@ -72,12 +72,20 @@ BEGIN
   -- Si la campagne passe à TERMINE
   IF NEW.status = 'TERMINE' AND OLD.status IS DISTINCT FROM 'TERMINE' THEN
     -- Pour chaque ligne d'inventaire avec un écart
-    INSERT INTO stock_movements (lot_id, article_id, depot_id, type, quantity, reason, created_by)
+    INSERT INTO stock_movements (
+      lot_id,
+      article_id,
+      depot_from_id,
+      movement_type,
+      qty,
+      notes,
+      performed_by
+    )
     SELECT 
       ic.lot_id, 
       ic.article_id, 
       ic.depot_id,
-      CASE WHEN ic.ecart > 0 THEN 'AJUSTEMENT_POS' ELSE 'AJUSTEMENT_NEG' END,
+      'AJUSTEMENT',
       ABS(ic.ecart),
       'Régularisation Inventaire Campagne : ' || NEW.code,
       NEW.validated_by

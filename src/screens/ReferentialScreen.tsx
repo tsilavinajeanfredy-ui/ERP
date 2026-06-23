@@ -1,11 +1,13 @@
 import * as React from 'react';
 import { View, StyleSheet, Text, useWindowDimensions, Alert, Platform, ActivityIndicator } from 'react-native';
-import { AnimatedPage, DataTable, ActionButton, Badge, C, PaginationControls, FormModal, FormInput, FormSelect, SectionTitle } from '../components/Ui';
+import { AnimatedPage, DataTable, ActionButton, Badge, C, ExportOverlay, PaginationControls, FormModal, FormInput, FormSelect, SectionTitle } from '../components/Ui';
 import { useTranslation } from '../lib/i18n';
 import { useSearch } from '../lib/search';
 import { useArticles, useSuppliers, useDepots, useSupplierEvalSummaries, useMutation, useUserProfile, confirmAction, useBoms, useNotification } from '../lib/hooks';
 import { CsvImportModal } from '../components/CsvImportModal';
 import { useQueryClient } from '@tanstack/react-query';
+import { generatePdf, getPdfTemplate } from '../lib/pdf';
+import { ProductDatasheet } from '../lib/database.types';
 import { ScrollView } from 'react-native';
 import * as XLSX from 'xlsx';
 import { supabase, getNextCode } from '../lib/supabase';
@@ -28,8 +30,9 @@ const CLASSIFICATION_MAP: Record<string, { label: string; color: string }> = {
 };
 
 // ─── Fetch toutes les données sans pagination puis export XLSX ───────────────
-async function fetchAllAndExport(tab: 'mp' | 'pf' | 'suppliers' | 'depots'): Promise<void> {
+async function fetchAllAndExport(tab: 'mp' | 'pf' | 'suppliers' | 'depots', onProgress?: (value: number) => void): Promise<void> {
   if (!supabase) { Alert.alert('Erreur', 'Client Supabase non initialisé.'); return; }
+  onProgress?.(0.05);
 
   let rows: any[] = [];
   let sheetName = '';
@@ -100,12 +103,14 @@ async function fetchAllAndExport(tab: 'mp' | 'pf' | 'suppliers' | 'depots'): Pro
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  onProgress?.(0.7);
 
   if (Platform.OS === 'web') {
     XLSX.writeFile(wb, fileName);
   } else {
     Alert.alert('Export XLSX', `Fichier généré : ${fileName}`);
   }
+  onProgress?.(1);
 }
 
 export function ReferentialScreen({ route }: any) {
@@ -118,14 +123,98 @@ export function ReferentialScreen({ route }: any) {
   );
   const { profile } = useUserProfile();
   const notify = useNotification();
+  const [exportProgress, setExportProgress] = React.useState(0);
   const [page, setPage] = React.useState(0);
+  const [mpPrefixFilter, setMpPrefixFilter] = React.useState<'SICD' | 'SPAH' | ''>('');
+  const [pfCategoryFilter, setPfCategoryFilter] = React.useState('');
   const limit = 20;
 
   const articleTypeFilter = activeTab === 'mp' ? 'MP' : activeTab === 'pf' ? 'PF' : undefined;
-  const { data: articles = [], count: articlesCount, isPending: loadingArticles } = useArticles(page, limit, articleTypeFilter, searchQuery);
+  // Passe le filtre de catégorie au serveur directement :
+  // MP → filtre par préfixe SICD/SPAH, PF → filtre par catégorie SAV/COR/BOU/ENC/PH/DET
+  const articlePrefixFilter = activeTab === 'mp' ? mpPrefixFilter
+    : activeTab === 'pf' && pfCategoryFilter ? `PF-${pfCategoryFilter}` : undefined;
+  const { data: articles = [], count: articlesCount, isPending: loadingArticles } = useArticles(page, limit, articleTypeFilter, searchQuery, articlePrefixFilter);
   const { data: suppliers = [], count: suppliersCount, isPending: loadingSuppliers } = useSuppliers(page, limit, searchQuery);
   const { data: depots = [], isPending: loadingDepots } = useDepots();
   const { data: evalSummaries = [] } = useSupplierEvalSummaries();
+
+  // ─── Fiche technique produit autonome (M6) ─────────────────────────────
+  const [datasheetModalVisible, setDatasheetModalVisible] = React.useState(false);
+  const [datasheetArticle, setDatasheetArticle] = React.useState<any>(null);
+  const [datasheetForm, setDatasheetForm] = React.useState<Partial<ProductDatasheet>>({});
+  const [datasheetLoading, setDatasheetLoading] = React.useState(false);
+
+  const openDatasheet = async (article: any) => {
+    setDatasheetArticle(article);
+    setDatasheetForm({ article_id: article.id, family: article.family, commercial_name: article.name, status: 'BROUILLON', version: 1 });
+    setDatasheetModalVisible(true);
+    if (!supabase) return;
+    const { data } = await supabase
+      .from('product_datasheets')
+      .select('*')
+      .eq('article_id', article.id)
+      .order('version', { ascending: false })
+      .limit(1);
+    if (data && data.length > 0) setDatasheetForm(data[0] as ProductDatasheet);
+  };
+
+  const saveDatasheet = async () => {
+    if (!supabase || !datasheetArticle) { setDatasheetModalVisible(false); return; }
+    setDatasheetLoading(true);
+    try {
+      const payload: any = {
+        family: datasheetForm.family ?? null,
+        commercial_name: datasheetForm.commercial_name ?? null,
+        description: datasheetForm.description ?? null,
+        quality_specs: datasheetForm.quality_specs ?? null,
+        physical_specs: datasheetForm.physical_specs ?? null,
+        packaging: datasheetForm.packaging ?? null,
+        storage_conditions: datasheetForm.storage_conditions ?? null,
+        shelf_life: datasheetForm.shelf_life ?? null,
+        usage_instructions: datasheetForm.usage_instructions ?? null,
+        regulatory: datasheetForm.regulatory ?? null,
+        status: datasheetForm.status ?? 'BROUILLON',
+      };
+      if (datasheetForm.id) {
+        await supabase.from('product_datasheets').update(payload).eq('id', datasheetForm.id);
+      } else {
+        await supabase.from('product_datasheets').insert({ ...payload, article_id: datasheetArticle.id, version: 1, created_by: profile?.id ?? null });
+      }
+      queryClient.invalidateQueries({ queryKey: ['product_datasheets'] });
+      setDatasheetModalVisible(false);
+    } catch (err: any) {
+      Alert.alert('Erreur', err?.message || 'Enregistrement de la fiche technique impossible.');
+    } finally {
+      setDatasheetLoading(false);
+    }
+  };
+
+  const generateDatasheetPdf = () => {
+    const a = datasheetArticle;
+    if (!a) return;
+    const f = datasheetForm;
+    const row = (label: string, val?: string | null) => val ? `<tr><td style="width:30%; font-weight:700;">${label}</td><td>${(val || '').replace(/\n/g, '<br/>')}</td></tr>` : '';
+    const html = getPdfTemplate(
+      `FICHE TECHNIQUE PRODUIT — ${a.code}`,
+      `<div class="summary-card">
+        <strong>PRODUIT :</strong> ${f.commercial_name || a.name}<br/>
+        <strong>CODE :</strong> ${a.code} &nbsp;·&nbsp; <strong>GAMME :</strong> ${f.family || a.family || '—'}<br/>
+        <strong>VERSION :</strong> ${f.version || 1} &nbsp;·&nbsp; <strong>STATUT :</strong> ${f.status || 'BROUILLON'}
+      </div>
+      <table>
+        ${row('Description', f.description)}
+        ${row('Spécifications qualité', f.quality_specs)}
+        ${row('Caractéristiques physiques', f.physical_specs)}
+        ${row('Conditionnement', f.packaging)}
+        ${row('Conditions de stockage', f.storage_conditions)}
+        ${row('Durée de vie / DLUO', f.shelf_life)}
+        ${row('Mode d\'emploi', f.usage_instructions)}
+        ${row('Mentions réglementaires', f.regulatory)}
+      </table>`,
+    );
+    generatePdf(html, `Fiche_Technique_${a.code}.pdf`);
+  };
 
   // ─── Filtre PF : n'afficher que les PF présents dans un BOM ─────────────
   const { data: boms = [] } = useBoms();
@@ -134,9 +223,9 @@ export function ReferentialScreen({ route }: any) {
     [boms]
   );
   const displayedArticles = React.useMemo(() => {
-    if (activeTab !== 'pf') return articles;
-    return articles.filter((a: any) => bomProductIds.has(a.id));
-  }, [articles, activeTab, bomProductIds]);
+    // Le filtre serveur (préfixe) gère déjà la catégorie PF — on retourne directement
+    return articles;
+  }, [articles]);
 
   const [showImport, setShowImport] = React.useState(false);
   const [evalModalVisible, setEvalModalVisible] = React.useState(false);
@@ -152,6 +241,38 @@ export function ReferentialScreen({ route }: any) {
   const [editSupplierVisible, setEditSupplierVisible] = React.useState(false);
   const [editSupplierForm, setEditSupplierForm] = React.useState<any>({});
   const [isSavingEdit, setIsSavingEdit] = React.useState(false);
+
+  // ─── Modal Modifier (article MP/PF) ───────────────────────────────────────
+  const [editArticleVisible, setEditArticleVisible] = React.useState(false);
+  const [editArticleForm, setEditArticleForm] = React.useState<any>({});
+  const [isSavingEditArticle, setIsSavingEditArticle] = React.useState(false);
+
+  const handleOpenEditArticle = (item: any) => {
+    setEditArticleForm({ ...item });
+    setEditArticleVisible(true);
+  };
+
+  const handleSaveEditArticle = async () => {
+    if (!supabase) return;
+    if (!editArticleForm.code?.trim() || !editArticleForm.name?.trim() || !editArticleForm.unit?.trim()) {
+      Alert.alert('Champs manquants', 'Code, Désignation et Unité sont obligatoires.'); return;
+    }
+    setIsSavingEditArticle(true);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        articleMutation.mutate(
+          { id: editArticleForm.id, values: editArticleForm, type: 'UPDATE' },
+          { onSuccess: () => resolve(), onError: (e) => reject(e) }
+        );
+      });
+      setEditArticleVisible(false);
+      setEditArticleForm({});
+    } catch (e: any) {
+      Alert.alert('Erreur', e?.message || 'Impossible de modifier.');
+    } finally {
+      setIsSavingEditArticle(false);
+    }
+  };
 
   const handleOpenEditSupplier = (item: any) => {
     setEditSupplierForm({ ...item });
@@ -185,7 +306,9 @@ export function ReferentialScreen({ route }: any) {
       'Supprimer le fournisseur',
       `Voulez-vous vraiment supprimer "${item.name}" ?`,
       () => supplierMutation.mutate({ id: item.id, type: 'DELETE' })
-    );
+    ,
+    'danger'
+  );
   };
 
   // Sélecteur de préfixe/catégorie avant ouverture du formulaire
@@ -203,7 +326,7 @@ export function ReferentialScreen({ route }: any) {
     { label: 'BOU – Bougie',    value: 'BOU' },
     { label: 'COR – Corde',     value: 'COR' },
     { label: 'EMB – Emballage', value: 'EMB' },
-    { label: 'SAC – Sac',       value: 'SAC' },
+    { label: 'SAV – Savon',     value: 'SAV' },
     { label: 'AUT – Autre',     value: 'AUT' },
   ];
 
@@ -320,7 +443,7 @@ export function ReferentialScreen({ route }: any) {
 
   const queryClient = useQueryClient();
 
-  React.useEffect(() => { setPage(0); }, [searchQuery, activeTab]);
+  React.useEffect(() => { setPage(0); }, [searchQuery, activeTab, mpPrefixFilter]);
 
   const handleOpenEval = (supplierId: string) => {
     setEvalFormData({ supplier_id: supplierId, period: 'YEARLY', year: new Date().getFullYear(), evaluated_by: profile?.id });
@@ -357,7 +480,7 @@ export function ReferentialScreen({ route }: any) {
 
   return (
     <AnimatedPage>
-      <ScrollView style={s.container}>
+      <ScrollView style={[s.container, { backgroundColor: '#F8F9FA' }]}>
         <View style={[s.tabs, isMobile && { flexDirection: 'column', alignItems: 'stretch' }]}>
           <ActionButton label="Matière Première" variant={activeTab === 'mp' ? 'primary' : 'secondary'} onPress={() => setActiveTab('mp')} />
           <ActionButton label="Produit Finit" variant={activeTab === 'pf' ? 'primary' : 'secondary'} onPress={() => setActiveTab('pf')} />
@@ -367,14 +490,17 @@ export function ReferentialScreen({ route }: any) {
           <ActionButton
             label={isExporting ? 'Export…' : 'Export XLSX'}
             icon={isExporting ? 'loading' : 'microsoft-excel'}
+            progress={isExporting ? exportProgress : undefined}
             onPress={async () => {
               if (isExporting) return;
+              setExportProgress(0);
               setIsExporting(true);
               try {
-                await fetchAllAndExport(activeTab);
+                await fetchAllAndExport(activeTab, setExportProgress);
               } catch (e: any) {
                 Alert.alert('Erreur export', e?.message || 'Impossible d\'exporter.');
               } finally {
+                setExportProgress(1);
                 setIsExporting(false);
               }
             }}
@@ -383,8 +509,51 @@ export function ReferentialScreen({ route }: any) {
           <ActionButton label="Import CSV" icon="file-excel" onPress={() => setShowImport(true)} variant="secondary" />
           <ActionButton label="Ajouter" icon="plus" onPress={handleOpenAdd} variant="primary" />
         </View>
+        <ExportOverlay visible={isExporting} progress={exportProgress} title="Export en cours..." />
 
         <View style={s.content}>
+          {activeTab === 'mp' && (
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginBottom: 16, paddingHorizontal: 4 }}>
+              {[
+                { label: 'Tous', value: '' },
+                { label: 'SICD', value: 'SICD' },
+                { label: 'SPAH', value: 'SPAH' },
+              ].map((opt) => (
+                <ActionButton
+                  key={opt.value}
+                  label={opt.label}
+                  onPress={() => {
+                    setMpPrefixFilter(opt.value as 'SICD' | 'SPAH' | '');
+                    console.log('Filter changed to:', opt.value);
+                  }}
+                  variant={mpPrefixFilter === opt.value ? 'primary' : 'secondary'}
+                />
+              ))}
+            </View>
+          )}
+          {activeTab === 'pf' && (
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 16, paddingHorizontal: 4 }}>
+              {[
+                { label: 'Tous',            value: '' },
+                { label: 'Savon',           value: 'SAV' },
+                { label: 'Corde',           value: 'COR' },
+                { label: 'Bougie',          value: 'BOU' },
+                { label: 'Encaustique',     value: 'ENC' },
+                { label: 'Papier Hyg.',     value: 'PH' },
+                { label: 'Détergent',       value: 'DET' },
+              ].map((opt) => (
+                <ActionButton
+                  key={opt.value}
+                  label={opt.label}
+                  onPress={() => {
+                    setPfCategoryFilter(opt.value);
+                    setPage(0);
+                  }}
+                  variant={pfCategoryFilter === opt.value ? 'primary' : 'secondary'}
+                />
+              ))}
+            </View>
+          )}
           {(activeTab === 'mp' || activeTab === 'pf') && (
             <DataTable
               data={displayedArticles}
@@ -397,10 +566,30 @@ export function ReferentialScreen({ route }: any) {
                   <Badge label={item.article_type} color={item.article_type === 'PF' ? C.green : C.info} />
                 )},
                 { key: 'unit', label: 'Unité', flex: 0.5 },
+                { key: 'colisage', label: 'Colisage', flex: 0.5, render: (item: any) => (
+                  <Text>{item.colisage || '-'}</Text>
+                )},
                 { key: 'active', label: 'Statut', flex: 0.7, render: (item: any) => (
                   <Text style={{ color: item.active ? C.ok : C.err, fontWeight: '700', fontSize: 12 }}>{item.active ? 'ACTIF' : 'INACTIF'}</Text>
                 )},
-                { key: 'actions', label: '', flex: 0.5, render: (item: any) => (
+                { key: 'actions', label: '', flex: activeTab === 'pf' ? 1.1 : 0.8, render: (item: any) => (
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                  {item.article_type === 'PF' && (
+                    <ActionButton
+                      label=""
+                      icon="file-document-outline"
+                      onPress={() => openDatasheet(item)}
+                      variant="secondary"
+                      compact
+                    />
+                  )}
+                  <ActionButton
+                    label=""
+                    icon="pencil"
+                    onPress={() => handleOpenEditArticle(item)}
+                    variant="secondary"
+                    compact
+                  />
                   <ActionButton
                     label=""
                     icon="trash-can-outline"
@@ -427,11 +616,14 @@ export function ReferentialScreen({ route }: any) {
                           }
                           articleMutation.mutate({ id: item.id, type: 'DELETE' });
                         }
-                      );
+                      ,
+    'danger'
+  );
                     }}
                     variant="secondary"
                     compact
                   />
+                  </View>
                 )},
               ]}
               onRowPress={(_item) => {}}
@@ -607,6 +799,100 @@ export function ReferentialScreen({ route }: any) {
         />
       </FormModal>
 
+      {/* ── Modal Modifier Article (MP/PF) ──────────────────────────────────── */}
+      <FormModal
+        visible={editArticleVisible}
+        title={`Modifier ${editArticleForm.article_type === 'PF' ? 'Produit Fini' : 'Matière Première'}`}
+        onClose={() => { setEditArticleVisible(false); setEditArticleForm({}); }}
+        onSave={handleSaveEditArticle}
+        loading={isSavingEditArticle}
+      >
+        <SectionTitle>IDENTIFICATION</SectionTitle>
+        <FormInput
+          label="Code *"
+          value={editArticleForm.code || ''}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, code: t.toUpperCase() })}
+          placeholder="MP-2025-001"
+        />
+        <FormInput
+          label="Désignation (FR) *"
+          value={editArticleForm.name || ''}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, name: t })}
+          placeholder="Nom de l'article"
+        />
+        <FormInput
+          label="Description (EN)"
+          value={editArticleForm.name_en || ''}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, name_en: t })}
+          placeholder="Article name in English"
+        />
+        <FormSelect
+          label="Unité *"
+          value={editArticleForm.unit || 'KG'}
+          options={[
+            { label: 'Kilogramme (KG)', value: 'KG' },
+            { label: 'Litre (L)', value: 'L' },
+            { label: 'Unité (U)', value: 'U' },
+            { label: 'Tonne (T)', value: 'T' },
+            { label: 'Mètre (M)', value: 'M' },
+            { label: 'Boîte (BTE)', value: 'BTE' },
+            { label: 'Carton (CTN)', value: 'CTN' },
+            { label: 'Gramme (G)', value: 'G' },
+          ]}
+          onSelect={(v: string) => setEditArticleForm({ ...editArticleForm, unit: v })}
+        />
+        <FormInput
+          label="Famille"
+          value={editArticleForm.family || ''}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, family: t })}
+          placeholder="Ex: CHIMIQUE, EMBALLAGE…"
+        />
+        <FormInput
+          label="Marque / Référence"
+          value={editArticleForm.brand || ''}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, brand: t })}
+        />
+        <SectionTitle>PARAMÈTRES STOCK</SectionTitle>
+        <FormInput
+          label="Stock de sécurité"
+          value={String(editArticleForm.safety_stock ?? '')}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, safety_stock: parseFloat(t) || 0 })}
+          keyboardType="decimal-pad"
+          placeholder="0"
+        />
+        <FormInput
+          label="Point de réapprovisionnement"
+          value={String(editArticleForm.reorder_point ?? '')}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, reorder_point: parseFloat(t) || 0 })}
+          keyboardType="decimal-pad"
+          placeholder="0"
+        />
+        <FormInput
+          label="Durée de conservation (jours)"
+          value={String(editArticleForm.shelf_life_days ?? '')}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, shelf_life_days: t.trim() ? parseInt(t, 10) || null : null })}
+          keyboardType="number-pad"
+          placeholder="Ex: 365 — vide = pas de calcul auto"
+        />
+        <FormInput
+          label="Colisage (unités/carton)"
+          value={String(editArticleForm.colisage ?? '')}
+          onChangeText={(t: string) => setEditArticleForm({ ...editArticleForm, colisage: t.trim() ? parseInt(t, 10) || 1 : 1 })}
+          keyboardType="number-pad"
+          placeholder="1"
+        />
+        <SectionTitle>STATUT</SectionTitle>
+        <FormSelect
+          label="Statut"
+          value={editArticleForm.active ? 'true' : 'false'}
+          options={[
+            { label: 'Actif', value: 'true' },
+            { label: 'Inactif', value: 'false' },
+          ]}
+          onSelect={(v: string) => setEditArticleForm({ ...editArticleForm, active: v === 'true' })}
+        />
+      </FormModal>
+
       {/* ── Modal Modifier Fournisseur ────────────────────────────────────── */}
       <FormModal
         visible={prefixPickerVisible}
@@ -712,6 +998,20 @@ export function ReferentialScreen({ route }: any) {
               keyboardType="decimal-pad"
               placeholder="0"
             />
+            <FormInput
+              label="Durée de conservation (jours)"
+              value={String(addForm.shelf_life_days ?? '')}
+              onChangeText={(t: string) => setAddForm({ ...addForm, shelf_life_days: t.trim() ? parseInt(t, 10) || null : null })}
+              keyboardType="number-pad"
+              placeholder="Ex: 365 — vide = pas de calcul auto"
+            />
+            <FormInput
+              label="Colisage (unités/carton)"
+              value={String(addForm.colisage ?? '')}
+              onChangeText={(t: string) => setAddForm({ ...addForm, colisage: t.trim() ? parseInt(t, 10) || 1 : 1 })}
+              keyboardType="number-pad"
+              placeholder="1"
+            />
           </>
         )}
 
@@ -815,12 +1115,43 @@ export function ReferentialScreen({ route }: any) {
           </>
         )}
       </FormModal>
+
+      <FormModal
+        visible={datasheetModalVisible}
+        title={`Fiche technique — ${datasheetArticle?.code || ''}`}
+        onClose={() => setDatasheetModalVisible(false)}
+        onSave={saveDatasheet}
+        loading={datasheetLoading}
+      >
+        <Text style={{ fontSize: 12, color: '#6C757D', marginBottom: 8 }}>
+          Fiche technique produit autonome (indépendante de la BOM) — spécifications qualité, conditionnement et stockage par gamme.
+        </Text>
+        <FormInput label="Nom commercial" value={datasheetForm.commercial_name ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, commercial_name: v })} />
+        <FormInput label="Gamme / Famille" value={datasheetForm.family ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, family: v })} />
+        <FormInput label="Description" value={datasheetForm.description ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, description: v })} multiline />
+        <FormInput label="Spécifications qualité (pH, TFM, viscosité…)" value={datasheetForm.quality_specs ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, quality_specs: v })} multiline />
+        <FormInput label="Caractéristiques physiques (aspect, couleur, odeur)" value={datasheetForm.physical_specs ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, physical_specs: v })} multiline />
+        <FormInput label="Conditionnement (format, emballage, palettisation)" value={datasheetForm.packaging ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, packaging: v })} multiline />
+        <FormInput label="Conditions de stockage" value={datasheetForm.storage_conditions ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, storage_conditions: v })} multiline />
+        <FormInput label="Durée de vie / DLUO" value={datasheetForm.shelf_life ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, shelf_life: v })} />
+        <FormInput label="Mode d'emploi / précautions" value={datasheetForm.usage_instructions ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, usage_instructions: v })} multiline />
+        <FormInput label="Mentions réglementaires" value={datasheetForm.regulatory ?? ''} onChangeText={(v) => setDatasheetForm({ ...datasheetForm, regulatory: v })} multiline />
+        <FormSelect
+          label="Statut"
+          value={datasheetForm.status ?? 'BROUILLON'}
+          options={[{ label: 'Brouillon', value: 'BROUILLON' }, { label: 'Validée', value: 'VALIDEE' }, { label: 'Archivée', value: 'ARCHIVEE' }]}
+          onSelect={(v: string) => setDatasheetForm({ ...datasheetForm, status: v })}
+        />
+        <View style={{ marginTop: 12 }}>
+          <ActionButton label="Générer PDF" icon="file-pdf-box" onPress={generateDatasheetPdf} variant="secondary" />
+        </View>
+      </FormModal>
     </AnimatedPage>
   );
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, padding: 20, backgroundColor: '#F8F9FA' },
-  tabs: { flexDirection: 'row', gap: 10, marginBottom: 20, alignItems: 'center' },
-  content: { flex: 1 },
+  container: { paddingBottom: 20 },
+  tabs: { flexDirection: 'row', gap: 10, marginBottom: 20, alignItems: 'center', paddingHorizontal: 20, paddingTop: 20 },
+  content: { paddingHorizontal: 20 },
 });

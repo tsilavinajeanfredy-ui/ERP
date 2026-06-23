@@ -96,6 +96,57 @@ export function MrpScreen() {
   const saveScenario = useSaveMRPScenario();
   const [saveSuccess, setSaveSuccess] = React.useState(false);
 
+  // ── Résultats persistés (dernière session en base) ────────────────────────
+  const [persistedResults, setPersistedResults] = React.useState<any[]>([]);
+  const [loadingPersisted, setLoadingPersisted] = React.useState(false);
+
+  const loadPersistedResults = React.useCallback(async () => {
+    if (!supabase) return;
+    setLoadingPersisted(true);
+    try {
+      // Trouver la dernière session_id
+      const { data: last } = await supabase
+        .from('mrp_suggestions')
+        .select('session_id, calculated_at')
+        .order('calculated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!last?.session_id) { setPersistedResults([]); return; }
+
+      const { data: rows } = await supabase
+        .from('mrp_suggestions')
+        .select('*')
+        .eq('session_id', last.session_id)
+        .order('priority', { ascending: true });
+
+      if (rows) {
+        setPersistedResults(rows.map((r: any) => ({
+          id:                    r.article_id,
+          code:                  r.article_code,
+          name:                  r.article_name,
+          type:                  r.article_type,
+          stock:                 r.stock_libere ?? 0,
+          needs:                 r.besoins_bruts ?? 0,
+          net:                   r.besoins_nets ?? 0,
+          incomingOrders:        r.commandes_cours ?? 0,
+          safety:                r.safety_stock ?? 0,
+          action:                r.action,
+          priority:              r.priority ?? 99,
+          manufacturingLeadTime: r.manufacturing_lead_time ?? 0,
+          supplierLeadTime:      r.supplier_lead_time ?? 0,
+          totalLeadTime:         r.total_lead_time ?? 0,
+          recommendedOrderDate:  r.recommended_order_date ?? null,
+          sourceProducts:        r.source_products ? JSON.parse(r.source_products) : [],
+        })));
+      }
+    } finally {
+      setLoadingPersisted(false);
+    }
+  }, []);
+
+  React.useEffect(() => { loadPersistedResults(); }, [loadPersistedResults]);
+
   // ── KPI dynamiques ───────────────────────────────────────────────────────
   const [lastSessionMeta, setLastSessionMeta] = React.useState<{
     calculatedAt:  Date | null;
@@ -122,7 +173,7 @@ export function MrpScreen() {
       .from('mrp_last_session_summary')
       .select('*')
       .maybeSingle()
-      .then(({ data }) => {
+      .then(({ data }: { data: any }) => {
         if (!data) return;
         const calcDate = new Date(data.calculated_at);
         setLastSessionMeta({
@@ -188,6 +239,7 @@ export function MrpScreen() {
       : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const freshResults = await runMRP({ demand_change: config.demand_change });
     if (freshResults.length > 0) await persistResults(freshResults, sessionId);
+    await loadPersistedResults();
   };
 
   const handleSaveScenario = async () => {
@@ -304,9 +356,13 @@ export function MrpScreen() {
   };
 
   // ── Résultats filtrés ────────────────────────────────────────────────────
+  // Utilise les résultats en mémoire (calcul en cours) ou les persistés (dernière session)
+  const activeResults = results.length > 0 ? results : persistedResults;
+  const isShowingPersisted = results.length === 0 && persistedResults.length > 0;
+
   const filteredResults = React.useMemo(() => {
-    if (results.length === 0) return [];
-    return results
+    if (activeResults.length === 0) return [];
+    return activeResults
       .filter(r => filterByScope(r.code, r.name))
       .filter(r => {
         if (config.article_filter === 'MP')    return r.type === 'MP' || r.code?.startsWith('MP-');
@@ -314,7 +370,7 @@ export function MrpScreen() {
         if (config.article_filter === 'MP_PF') return r.type === 'MP' || r.type === 'PF';
         return true;
       });
-  }, [results, filterByScope, config.article_filter]);
+  }, [activeResults, filterByScope, config.article_filter]);
 
   const criticalItems = React.useMemo(
     () => filteredResults.filter(r => r.action === 'RUPTURE_RISQUE' || r.action === 'COMMANDE_URGENTE'),
@@ -422,6 +478,16 @@ export function MrpScreen() {
               <Text style={s.successText}>
                 {filteredResults.length} article(s) calculés · {criticalItems.length} alerte(s) ·
                 Résultats persistés en base.
+              </Text>
+            </View>
+          )}
+
+          {isShowingPersisted && status !== 'RUNNING' && status !== 'COMPLETED' && (
+            <View style={[s.successMsg, { backgroundColor: '#EFF6FF', borderColor: '#BFDBFE', borderWidth: 1 }]}>
+              <MaterialCommunityIcons name="database-check-outline" size={20} color={C.info} />
+              <Text style={[s.successText, { color: '#1D4ED8' }]}>
+                {filteredResults.length} article(s) — Dernière session persistée en base.{' '}
+                {loadingPersisted ? 'Chargement...' : 'Lancez un nouveau calcul pour actualiser.'}
               </Text>
             </View>
           )}

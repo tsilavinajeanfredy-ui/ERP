@@ -21,12 +21,6 @@ BEGIN
     prefix := 'FNC-';
   ELSIF TG_TABLE_NAME = 'inventory_campaigns' THEN
     prefix := 'INV-';
-  ELSIF TG_TABLE_NAME = 'stock_movements' THEN
-    IF NEW.type IN ('AJUSTEMENT_POS', 'AJUSTEMENT_NEG') THEN
-      prefix := 'AJ-';
-    ELSE
-      RETURN NEW; -- Ne génère pas de code pour les autres mouvements
-    END IF;
   ELSIF TG_TABLE_NAME = 'articles' THEN
     -- Utilise le type de l'article selon le CCTP (MP, PF, EMB, SF) pour éviter les doublons
     prefix := COALESCE(NEW.article_type, 'ART') || '-';
@@ -150,10 +144,37 @@ CREATE OR REPLACE FUNCTION process_stock_adjustment(
   p_reason TEXT,
   p_type TEXT
 ) RETURNS VOID AS $$
+DECLARE
+  v_article_id uuid;
+  v_depot_id uuid;
 BEGIN
+  SELECT article_id, depot_id
+  INTO v_article_id, v_depot_id
+  FROM lots
+  WHERE id = p_lot_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Lot introuvable : %', p_lot_id;
+  END IF;
+
   -- 1. Insérer le mouvement de stock
-  INSERT INTO stock_movements (lot_id, type, quantity, reason, created_by)
-  VALUES (p_lot_id, p_type, p_qty, p_reason, auth.uid());
+  INSERT INTO stock_movements (
+    lot_id,
+    article_id,
+    depot_from_id,
+    movement_type,
+    qty,
+    notes,
+    performed_by
+  ) VALUES (
+    p_lot_id,
+    v_article_id,
+    v_depot_id,
+    'AJUSTEMENT',
+    p_qty,
+    p_reason,
+    auth.uid()
+  );
 
   -- 2. Mettre à jour la quantité du lot
   IF p_type = 'AJUSTEMENT_POS' THEN
