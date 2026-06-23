@@ -146,7 +146,7 @@ export function PlanningLogistiqueScreen() {
     local:  '#9B59B6',
   };
   const typeIcon: Record<PlanType, string> = {
-    import: 'truck-delivery',
+    import: 'ferry',
     local:  'map-marker',
   };
   const typeLabel: Record<PlanType, string> = {

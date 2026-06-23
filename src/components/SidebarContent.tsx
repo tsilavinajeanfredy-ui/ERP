@@ -25,11 +25,17 @@ export function SidebarContent(props: DrawerContentComponentProps) {
     supabase?.auth.signOut();
   };
 
-  const nav = (route: string) => {
-    props.navigation.navigate(route);
+  const nav = (route: string, params?: object) => {
+    (props.navigation.navigate as unknown as (name: string, params?: object) => void)(route, params);
   };
 
-  const currentRoute = props.state.routes[props.state.index].name;
+  const focusedRoute = props.state.routes[props.state.index];
+  const currentRoute = focusedRoute.name;
+  // Onglet RH actif (l'écran RH lit ce paramètre pour afficher la bonne section)
+  const rhActiveTab =
+    currentRoute === 'Rh'
+      ? ((focusedRoute.params as { tab?: string } | undefined)?.tab ?? 'personnels')
+      : null;
   const { counts } = useSidebarCounts(currentRoute);
 
   return (
@@ -66,7 +72,7 @@ export function SidebarContent(props: DrawerContentComponentProps) {
           <SidebarItem label={t('referential')} icon="database-cog-outline" active={currentRoute === 'Referential'} isCollapsed={isCollapsed} onPress={() => nav('Referential')} />
         )}
         {canAccessScreen('Shipping') && (
-          <SidebarItem label={t('shipping')} icon="truck-fast" active={currentRoute === 'Shipping'} isCollapsed={isCollapsed} onPress={() => nav('Shipping')} />
+          <SidebarItem label={t('shipping')} icon="truck-fast" badge={counts.shipping} active={currentRoute === 'Shipping'} isCollapsed={isCollapsed} onPress={() => nav('Shipping')} />
         )}
         {canAccessScreen('Fnc') && (
           <SidebarItem label={t('fnc')} icon="alert-circle-outline" active={currentRoute === 'Fnc'} isCollapsed={isCollapsed} onPress={() => nav('Fnc')} />
@@ -95,7 +101,7 @@ export function SidebarContent(props: DrawerContentComponentProps) {
           <SidebarItem label={t('reception')} icon="email-receive-outline" badge={counts.reception} active={currentRoute === 'Reception'} isCollapsed={isCollapsed} onPress={() => nav('Reception')} />
         )}
         {canAccessScreen('ReceptionPF') && (
-          <SidebarItem label="Réception PF" icon="package-down" active={currentRoute === 'ReceptionPF'} isCollapsed={isCollapsed} onPress={() => nav('ReceptionPF')} />
+          <SidebarItem label="Réception PF" icon="package-down" badge={counts.receptionPF} active={currentRoute === 'ReceptionPF'} isCollapsed={isCollapsed} onPress={() => nav('ReceptionPF')} />
         )}
         {canAccessScreen('Laboratory') && (
           <SidebarItem label={t('laboratory')} icon="flask-outline" badge={counts.laboratory} active={currentRoute === 'Laboratory'} isCollapsed={isCollapsed} onPress={() => nav('Laboratory')} />
@@ -104,7 +110,7 @@ export function SidebarContent(props: DrawerContentComponentProps) {
           <SidebarItem label={t('nav_production')} icon="factory" active={currentRoute === 'Production'} isCollapsed={isCollapsed} onPress={() => nav('Production')} />
         )}
         {canAccessScreen('Stocks') && (
-          <SidebarItem label={t('stocks')} icon="package-variant-closed" active={currentRoute === 'Stocks'} isCollapsed={isCollapsed} onPress={() => nav('Stocks')} />
+          <SidebarItem label={t('stocks')} icon="package-variant-closed" badge={counts.stocks} active={currentRoute === 'Stocks'} isCollapsed={isCollapsed} onPress={() => nav('Stocks')} />
         )}
         {canAccessScreen('Inventory') && (
           <SidebarItem label={t('inventory')} icon="clipboard-list-outline" active={currentRoute === 'Inventory'} isCollapsed={isCollapsed} onPress={() => nav('Inventory')} />
@@ -121,6 +127,9 @@ export function SidebarContent(props: DrawerContentComponentProps) {
         {canAccessScreen('Instruments') && (
           <SidebarItem label="Instruments" icon="tune" active={currentRoute === 'Instruments'} isCollapsed={isCollapsed} onPress={() => nav('Instruments')} />
         )}
+        {canAccessScreen('CalibrationManagement') && (
+          <SidebarItem label="Calendrier Étalonnage" icon="calendar-clock-outline" active={currentRoute === 'CalibrationManagement'} isCollapsed={isCollapsed} onPress={() => nav('CalibrationManagement')} />
+        )}
 
 
         <View style={{ height: 20 }} />
@@ -129,7 +138,13 @@ export function SidebarContent(props: DrawerContentComponentProps) {
         {canAccessScreen('Rh') && (
           <>
             {!isCollapsed && <Text style={s.sectionTitle}>RESSOURCES HUMAINES</Text>}
-            <SidebarItem label="RH & Affectations" icon="account-switch-outline" active={currentRoute === 'Rh'} isCollapsed={isCollapsed} onPress={() => nav('Rh')} />
+            <SidebarItem label="Personnels"   icon="account-group-outline"  active={rhActiveTab === 'personnels'}   isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'personnels' })} />
+            <SidebarItem label="Affectations" icon="account-switch-outline" active={rhActiveTab === 'affectations'} isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'affectations' })} />
+            <SidebarItem label="Heures Supp." icon="clock-alert-outline"    active={rhActiveTab === 'heures_sup'}   isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'heures_sup' })} />
+            <SidebarItem label="Saisie"       icon="pencil-plus-outline"    active={rhActiveTab === 'saisie'}       isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'saisie' })} />
+            <SidebarItem label="Budget"       icon="chart-bar"              active={rhActiveTab === 'budget'}       isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'budget' })} />
+            <SidebarItem label="Congés"       icon="beach"                  active={rhActiveTab === 'conges'}       isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'conges' })} />
+            <SidebarItem label="Imports"      icon="history"                active={rhActiveTab === 'historique'}   isCollapsed={isCollapsed} onPress={() => nav('Rh', { tab: 'historique' })} />
             <View style={{ height: 20 }} />
           </>
         )}

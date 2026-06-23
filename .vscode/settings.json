@@ -4,5 +4,7 @@
     "supabase/functions"
   ],
   "deno.lint": true,
-  "deno.unstable": true
+  "deno.unstable": true,
+  "chat.utilityModel": "gemini/models/gemini-3-flash-preview",
+  "chat.utilitySmallModel": "gemini/models/gemini-3-pro-preview"
 }

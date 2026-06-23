@@ -2,11 +2,69 @@ import * as React from 'react';
 import { ScrollView, StyleSheet, Text, View, ActivityIndicator, TouchableOpacity, useWindowDimensions, Platform, Alert } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { C, KpiCard, ActionButton, AnimatedPage, FormModal, FormInput, FormSelect, FormDatePicker } from '../components/Ui';
-import { useInventoryCampaigns, useMutation, useDepots, useOfflineInventory, useArticles, useLots, useInventoryEcartsView, useReconcileInventory, useUserProfile, usePermissions, useNotification } from '../lib/hooks';
+import { ScannerModal } from '../components/ScannerModal';
+import { useInventoryCampaigns, useMutation, useDepots, useOfflineInventory, useArticles, useLots, useInventoryEcartsView, useReconcileInventory, useInventorySheets, useUserProfile, usePermissions, useNotification } from '../lib/hooks';
+import { useReconcileInventoryAuto, useQuarantineAlerts } from '../lib/hooks/signatures';
+import { supabase } from '../lib/supabase';
+import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from '../lib/i18n';
 import { generatePdf, getPdfTemplate } from '../lib/pdf';
 import { playNotificationSound } from '../lib/notificationSound';
 import { N } from '../lib/notifIcons';
+import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
+
+const exportToXLSX = async (data: any[], filename: string) => {
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Inventaire');
+  if (Platform.OS === 'web') {
+    XLSX.writeFile(wb, filename);
+  } else {
+    try {
+      const base64 = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+      const uri = FileSystem.documentDirectory + filename;
+      await FileSystem.writeAsStringAsync(uri, base64, { encoding: FileSystem.EncodingType.Base64 });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri);
+      } else {
+        Alert.alert("Erreur", "Le partage n'est pas disponible sur cet appareil.");
+      }
+    } catch (e) {
+      console.error(e);
+      Alert.alert("Erreur", "Impossible d'exporter le fichier Excel.");
+    }
+  }
+};
+
+const exportToCSV = async (data: any[], filename: string) => {
+  const csv = Papa.unparse(data);
+  if (Platform.OS === 'web') {
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.href = url;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } else {
+    try {
+      const uri = FileSystem.documentDirectory + filename;
+      await FileSystem.writeAsStringAsync(uri, csv, { encoding: FileSystem.EncodingType.UTF8 });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri);
+      } else {
+        Alert.alert("Erreur", "Le partage n'est pas disponible sur cet appareil.");
+      }
+    } catch (e) {
+      console.error(e);
+      Alert.alert("Erreur", "Impossible d'exporter le fichier CSV.");
+    }
+  }
+};
 
 const STATUS_MAP: Record<string, { label: string; color: string }> = {
   EN_PREPARATION: { label: 'En préparation', color: '#ADB5BD' },
@@ -22,6 +80,7 @@ export function InventoryScreen() {
   const { profile } = useUserProfile();
   const { canPerformAction, role } = usePermissions();
   const notify = useNotification();
+  const [scannerVisible, setScannerVisible] = React.useState(false);
 
   const { data: campaigns = [], isPending: loading } = useInventoryCampaigns();
   const { data: depots = [] } = useDepots();
@@ -37,7 +96,12 @@ export function InventoryScreen() {
 
   const mutation = useMutation('inventory_campaigns', () => setModalVisible(false));
   const reconcileMutation = useReconcileInventory();
+  const reconcileAutoMutation = useReconcileInventoryAuto();
+  const { data: quarantineAlerts = [] } = useQuarantineAlerts();
   const { data: ecarts = [] } = useInventoryEcartsView(selId ?? undefined);
+  const { data: inventorySheets = [] } = useInventorySheets(selId ?? undefined);
+  const queryClient = useQueryClient();
+  const [generatingSheets, setGeneratingSheets] = React.useState(false);
   const [histModalVisible, setHistModalVisible] = React.useState(false);
   const [reconcileModalVisible, setReconcileModalVisible] = React.useState(false);
 
@@ -117,27 +181,62 @@ export function InventoryScreen() {
     setCountModalVisible(false);
   };
 
+  const handleGenerateSheets = async () => {
+    if (!selId) return;
+    if (!supabase) { Alert.alert('Hors-ligne', 'Connexion requise pour générer les fiches.'); return; }
+    if (inventorySheets.length > 0) {
+      Alert.alert('Déjà généré', `Cette campagne possède déjà ${inventorySheets.length} fiche(s) pré-numérotée(s).`);
+      return;
+    }
+    setGeneratingSheets(true);
+    try {
+      const { data, error } = await supabase.rpc('generate_inventory_sheets', { p_campaign_id: selId });
+      if (error) throw error;
+      queryClient.invalidateQueries({ queryKey: ['inventory_sheets'] });
+      Alert.alert('Fiches générées', `${typeof data === 'number' ? data : 0} fiche(s) pré-numérotée(s) créée(s).`);
+    } catch (err: any) {
+      Alert.alert('Erreur', err?.message || 'Génération des fiches impossible.');
+    } finally {
+      setGeneratingSheets(false);
+    }
+  };
+
   const handlePrintSheets = () => {
     const camp = campaigns.find(c => c.id === selId);
     if (!camp) return;
-    const rows = articles.map(a => {
-      const theo = lots.filter(l => l.article_id === a.id).reduce((s, l) => s + (l.qty_current || 0), 0);
+    // Fiches pré-numérotées persistées si disponibles, sinon fallback (numérotation à la volée)
+    const source: { article_id: string | null; sheet_number: number }[] = inventorySheets.length > 0
+      ? inventorySheets.map(sh => ({ article_id: sh.article_id, sheet_number: sh.sheet_number }))
+      : articles.map((a, idx) => ({ article_id: a.id, sheet_number: idx + 1 }));
+    const rows = source.map((src) => {
+      const a = articles.find(x => x.id === src.article_id);
+      const theo = lots.filter(l => l.article_id === src.article_id).reduce((s, l) => s + (l.qty_current || 0), 0);
+      const sheetNum = String(src.sheet_number).padStart(4, '0');
+      const sheetId = `${camp.code}/${sheetNum}`;
+      if (!a) {
+        return `
+        <tr>
+          <td style="width:8%; font-family:monospace; font-size:9pt; color:#6C757D;">${sheetId}</td>
+          <td colspan="6" style="color:#ADB5BD;">—</td>
+        </tr>`;
+      }
       return `
         <tr>
+          <td style="width:8%; font-family:monospace; font-size:9pt; color:#6C757D;">${sheetId}</td>
           <td style="width:12%;">${a.code}</td>
-          <td style="width:33%;">${a.name}</td>
-          <td style="width:15%;">${a.article_type || '—'}</td>
-          <td style="width:12%; text-align:right;">${theo.toLocaleString()}</td>
-          <td style="width:13%;">${a.unit || 'KG'}</td>
-          <td style="width:15%;"><span style="border-bottom:1px solid #000; display:inline-block; min-width:80px;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></td>
+          <td style="width:30%;">${a.name}</td>
+          <td style="width:13%;">${a.article_type || '—'}</td>
+          <td style="width:10%; text-align:right;">${theo.toLocaleString()}</td>
+          <td style="width:10%;">${a.unit || 'KG'}</td>
+          <td style="width:17%;"><span style="border-bottom:1px solid #000; display:inline-block; min-width:90px;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></td>
         </tr>`;
     }).join('');
     const html = getPdfTemplate(
       `FICHE DE COMPTAGE - ${camp.code}`,
       `<p style="font-size:10pt; margin-bottom:20px;">Campagne : <strong>${camp.label || camp.code}</strong> · Date : ${new Date().toLocaleDateString('fr-FR')}</p>
       <table><thead><tr>
-        <th style="width:12%;">Code</th><th style="width:33%;">Article</th><th style="width:15%;">Type</th>
-        <th style="width:12%;" class="text-right">Stock</th><th style="width:13%;">Unité</th><th style="width:15%;" class="text-center">Compté</th>
+        <th style="width:8%;">N° Fiche</th><th style="width:12%;">Code</th><th style="width:30%;">Article</th><th style="width:13%;">Type</th>
+        <th style="width:10%;" class="text-right">Stock</th><th style="width:10%;">Unité</th><th style="width:17%;" class="text-center">Compté</th>
       </tr></thead><tbody>${rows}</tbody></table>
       <p style="margin-top:20px; font-size:9pt; color:#666;">Signature compteur 1 : ___________________  Signature compteur 2 : ___________________</p>`,
       { orientation: 'landscape', watermark: 'INVENTAIRE' },
@@ -245,6 +344,26 @@ export function InventoryScreen() {
 
       <View style={{ height: 24 }} />
 
+      {/* Bannière alertes quarantaine */}
+      {quarantineAlerts.length > 0 && (
+        <View style={{ backgroundColor: '#FFF3CD', borderRadius: 8, padding: 14, marginBottom: 16, flexDirection: 'row', alignItems: 'center', gap: 10, borderLeftWidth: 4, borderLeftColor: '#FFC107' }}>
+          <MaterialCommunityIcons name="alert" size={20} color="#856404" />
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: 13, fontWeight: '800', color: '#856404' }}>
+              {quarantineAlerts.length} lot(s) bloqué(s)/quarantaine depuis +7 jours
+            </Text>
+            {quarantineAlerts.slice(0, 3).map((a: any) => (
+              <Text key={a.lot_id} style={{ fontSize: 11, color: '#856404', marginTop: 2 }}>
+                {'• '}{a.lot_code} ({a.article_name}) — {a.days_in_status}j en {a.cqlib_status}
+              </Text>
+            ))}
+            {quarantineAlerts.length > 3 && (
+              <Text style={{ fontSize: 11, color: '#856404', marginTop: 2 }}>+ {quarantineAlerts.length - 3} autre(s)</Text>
+            )}
+          </View>
+        </View>
+      )}
+
       <Text style={s.sectionLabel}>CAMPAGNES RÉCENTES</Text>
       
       <View style={[s.listGrid, isMobile && { flexDirection: 'column' }]}>
@@ -297,25 +416,110 @@ export function InventoryScreen() {
               <Text style={s.detailTitle}>{t('inventory_campaign_actions')} {camp?.code}</Text>
               <View style={s.detailActions}>
                 {canPerformAction('create_inventory') && (
-                  <ActionButton 
-                    label="Saisir comptages" 
-                    onPress={() => {
-                      setCountData({ campaign_id: selId, depot_id: depots[0]?.id });
-                      setCountModalVisible(true);
-                    }} 
-                    variant="primary" 
+                  <>
+                    <ActionButton 
+                      label="Saisir comptages" 
+                      onPress={() => {
+                        setCountData({ campaign_id: selId, depot_id: depots[0]?.id });
+                        setCountModalVisible(true);
+                      }} 
+                      variant="primary" 
+                    />
+                    <ActionButton 
+                      label="Scanner" 
+                      icon="barcode-scan"
+                      onPress={() => setScannerVisible(true)} 
+                      variant="primary" 
+                    />
+                  </>
+                )}
+                {canPerformAction('create_inventory') && (
+                  <ActionButton
+                    label={generatingSheets ? 'Génération…' : inventorySheets.length > 0 ? `Fiches pré-numérotées (${inventorySheets.length})` : 'Générer fiches pré-numérotées'}
+                    icon="format-list-numbered"
+                    onPress={handleGenerateSheets}
                   />
                 )}
                 <ActionButton label="Imprimer fiches" icon="printer" onPress={handlePrintSheets} />
                 <ActionButton label="Générer rapport PDF" icon="file-pdf-box" onPress={handleGenerateEcart} />
+                <ActionButton
+                  label="Export CSV"
+                  icon="file-delimited-outline"
+                  onPress={() => {
+                    const camp = campaigns.find(c => c.id === selId);
+                    const data = ecarts.map(e => ({
+                      Campagne: camp?.code || selId,
+                      Code: e.article_code,
+                      Article: e.article_name,
+                      Type: e.article_type,
+                      Dépôt: e.depot_name,
+                      'Code Dépôt': e.depot_code,
+                      Lot: e.lot_code || '',
+                      Théorique: e.stock_theorique ?? 0,
+                      Physique: e.stock_physique ?? '',
+                      Écart: e.ecart ?? '',
+                      'Écart %': e.ecart_pct ?? '',
+                      Unité: (e as any).unit || 'KG',
+                      Statut: e.reconciliation_status,
+                      Majeur: e.is_major ? 'Oui' : 'Non',
+                    }));
+                    exportToCSV(data, `Inventaire_${camp?.code || selId}_${new Date().toISOString().split('T')[0]}.csv`);
+                  }}
+                />
+                <ActionButton
+                  label="Export Excel"
+                  icon="microsoft-excel"
+                  onPress={() => {
+                    const camp = campaigns.find(c => c.id === selId);
+                    const data = ecarts.map(e => ({
+                      Campagne: camp?.code || selId,
+                      Code: e.article_code,
+                      Article: e.article_name,
+                      Type: e.article_type,
+                      Dépôt: e.depot_name,
+                      'Code Dépôt': e.depot_code,
+                      Lot: e.lot_code || '',
+                      Théorique: e.stock_theorique ?? 0,
+                      Physique: e.stock_physique ?? '',
+                      Écart: e.ecart ?? '',
+                      'Écart %': e.ecart_pct ?? '',
+                      Unité: (e as any).unit || 'KG',
+                      Statut: e.reconciliation_status,
+                      Majeur: e.is_major ? 'Oui' : 'Non',
+                    }));
+                    exportToXLSX(data, `Inventaire_${camp?.code || selId}_${new Date().toISOString().split('T')[0]}.xlsx`);
+                  }}
+                  color={C.ok}
+                />
                 {camp?.status !== 'VALIDE' && (canPerformAction('create_inventory') || canPerformAction('validate_inventory') || role === 'RACH') && (
-                  <ActionButton 
-                    label="Réconcilier les stocks" 
-                    icon="check-circle" 
-                    onPress={() => setReconcileModalVisible(true)} 
-                    color={C.ok} 
-                    variant="primary"
-                  />
+                  <>
+                    <ActionButton
+                      label="Rapprochement auto"
+                      icon="calculator-variant"
+                      loading={reconcileAutoMutation.isPending}
+                      onPress={() => {
+                        if (!selId || !profile?.id) return;
+                        reconcileAutoMutation.mutate({ campaignId: selId, userId: profile.id }, {
+                          onSuccess: (data: any[]) => {
+                            const majeurs = data?.filter((r: any) => r.ecart_status === 'MAJEUR' || r.ecart_status === 'CRITIQUE').length ?? 0;
+                            Alert.alert(
+                              'Rapprochement terminé',
+                              `${data?.length ?? 0} articles analysés. ${majeurs > 0 ? majeurs + ' écart(s) majeur(s) détecté(s).' : 'Aucun écart critique.'}`,
+                            );
+                          },
+                          onError: (err: any) => Alert.alert('Erreur', err.message),
+                        });
+                      }}
+                      color={C.info}
+                    />
+                    <ActionButton
+                      label="Réconcilier les stocks"
+                      icon="check-circle"
+                      onPress={() => setReconcileModalVisible(true)}
+                      color={C.ok}
+                      variant="primary"
+                    />
+                  </>
                 )}
               </View>
 
@@ -328,6 +532,44 @@ export function InventoryScreen() {
                 </View>
               )}
             </View>
+
+            {/* Local offline counts table */}
+            {offlineCounts.filter(c => c.campaign_id === selId).length > 0 && (
+              <View style={s.tableCard}>
+                <View style={[s.tableHeader, { backgroundColor: '#FFF9E6' }]}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <MaterialCommunityIcons name="cloud-sync" size={18} color="#856404" />
+                    <Text style={[s.tableTitle, { color: '#856404' }]}>Comptages saisis (En attente de synchronisation)</Text>
+                  </View>
+                  <Text style={s.tableSub}>Ces données sont enregistrées sur votre appareil. Cliquez sur Sync pour les envoyer au serveur.</Text>
+                </View>
+                <View style={[s.tr, { backgroundColor: '#F8F9FA', borderBottomWidth: 2, borderBottomColor: '#E9ECEF' }]}>
+                  <View style={{ flex: 2 }}><Text style={s.thText}>ARTICLE / LOT</Text></View>
+                  <View style={{ flex: 1 }}><Text style={s.thText}>DÉPÔT</Text></View>
+                  <View style={{ width: 100, alignItems: 'flex-end' }}><Text style={s.thText}>COMPTÉ</Text></View>
+                </View>
+                {offlineCounts.filter(c => c.campaign_id === selId).map((c, idx, arr) => {
+                  const article = articles.find(a => a.id === c.article_id);
+                  const depot = depots.find(d => d.id === c.depot_id);
+                  const lot = lots.find(l => l.id === c.lot_id);
+                  return (
+                    <View key={idx} style={[s.tr, idx === arr.length - 1 && { borderBottomWidth: 0 }]}>
+                      <View style={{ flex: 2 }}>
+                        <Text style={s.tdCode}>{article?.code || 'Inconnu'}</Text>
+                        <Text style={s.tdArticle}>{article?.name}</Text>
+                        {lot && <Text style={{ fontSize: 11, color: '#6C757D', marginTop: 2 }}>Lot: {lot.code}</Text>}
+                      </View>
+                      <View style={{ flex: 1, justifyContent: 'center' }}>
+                        <Text style={{ fontSize: 12, color: '#495057', fontWeight: '600' }}>{depot?.name || '—'}</Text>
+                      </View>
+                      <View style={{ width: 100, alignItems: 'flex-end', justifyContent: 'center' }}>
+                        <Text style={{ fontSize: 13, color: '#1A1A1A', fontWeight: '800' }}>{c.qty_counted} {c.unit}</Text>
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
 
             {/* Discrepancy analysis table */}
             <View style={s.tableCard}>
@@ -342,6 +584,7 @@ export function InventoryScreen() {
                 <View style={{ width: 100, alignItems: 'flex-end' }}><Text style={s.thText}>THÉORIQUE</Text></View>
                 <View style={{ width: 100, alignItems: 'flex-end' }}><Text style={s.thText}>PHYSIQUE</Text></View>
                 <View style={{ width: 100, alignItems: 'flex-end' }}><Text style={s.thText}>ÉCART</Text></View>
+                <View style={{ width: 60, alignItems: 'center' }}><Text style={s.thText}>UNITÉ</Text></View>
                 <View style={{ width: 120, alignItems: 'flex-end' }}><Text style={s.thText}>STATUT / GRAVITÉ</Text></View>
               </View>
 
@@ -385,6 +628,12 @@ export function InventoryScreen() {
                         ) : (
                           <Text style={{ fontSize: 13, color: '#28A745', fontWeight: '700' }}>{t('inventory_conform')}</Text>
                         )}
+                      </View>
+
+                      <View style={{ width: 60, alignItems: 'center', justifyContent: 'center' }}>
+                        <Text style={{ fontSize: 11, fontWeight: '700', color: '#6C757D', backgroundColor: '#F1F3F5', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                          {(e as any).unit || 'KG'}
+                        </Text>
                       </View>
 
                       <View style={{ width: 120, alignItems: 'flex-end', justifyContent: 'center' }}>
@@ -517,7 +766,7 @@ export function InventoryScreen() {
             <View key={c.id} style={{ paddingVertical: 12, borderBottomWidth: i < arr.length - 1 ? 1 : 0, borderBottomColor: '#F0F0F0' }}>
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Text style={{ fontSize: 14, fontWeight: '700', color: '#1A1A1A' }}>{c.code}</Text>
-                <Text style={{ fontSize: 12, color: c.status === 'VALIDE' ? '#28A745' : '#888', fontWeight: '600' }}>{c.status}</Text>
+                <Text style={{ fontSize: 12, color: c.status === 'VALIDE' ? '#28A745' : '#888', fontWeight: '600' }}>{c.status?.replace(/_/g, ' ')}</Text>
               </View>
               {c.label && <Text style={{ fontSize: 13, color: '#555', marginTop: 2 }}>{c.label}</Text>}
               {c.period && <Text style={{ fontSize: 12, color: '#888' }}>{t('inventory_period')} : {c.period}</Text>}
@@ -686,6 +935,25 @@ export function InventoryScreen() {
         )}
       </FormModal>
 
+      <ScannerModal
+        visible={scannerVisible}
+        onClose={() => setScannerVisible(false)}
+        onScan={(data) => {
+          // On essaie de trouver l'article correspondant (par code article ou code de lot)
+          const lot = lots.find(l => l.code.toUpperCase() === data.toUpperCase());
+          const article = articles.find(a => a.code.toUpperCase() === data.toUpperCase());
+          
+          if (lot) {
+            setCountData({ campaign_id: selId, depot_id: lot.depot_id, article_id: lot.article_id, lot_id: lot.id });
+          } else if (article) {
+            setCountData({ campaign_id: selId, depot_id: depots[0]?.id, article_id: article.id });
+          } else {
+            Alert.alert("Scanner", `Code non reconnu : ${data}`);
+            return;
+          }
+          setCountModalVisible(true);
+        }}
+      />
     </AnimatedPage>
   );
 }

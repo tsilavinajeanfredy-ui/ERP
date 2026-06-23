@@ -221,8 +221,8 @@ export function SageSyncScreen() {
                           <Text style={s.tdDetail}>
                             {table === 'lots' ? `Quantité : ${rec.qty_current} ${rec.unit || 'KG'}` :
                              table === 'stock_movements' ? `Type : ${rec.movement_type} · Qté : ${rec.qty}` :
-                             table === 'da_import' ? `Statut : ${rec.status} · Valeur : ${rec.proforma_value_eur || '0'} EUR` :
-                             `Statut : ${rec.status} · Qté : ${rec.qty}`}
+                             table === 'da_import' ? `Statut : ${rec.status?.replace(/_/g, ' ')} · Valeur : ${rec.proforma_value_eur || '0'} EUR` :
+                             `Statut : ${rec.status?.replace(/_/g, ' ')} · Qté : ${rec.qty}`}
                           </Text>
                         </View>
                         <View style={{ width: 100, alignItems: 'flex-end', justifyContent: 'center' }}>

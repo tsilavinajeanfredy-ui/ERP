@@ -1,19 +1,30 @@
 import * as React from 'react';
 import { ScrollView, StyleSheet, Text, View, Platform, useWindowDimensions, TouchableOpacity } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { C, KpiCard, ActionButton, AnimatedPage, ExportOverlay, SectionTitle, Badge } from '../components/Ui';
+import { C, KpiCard, ActionButton, AnimatedPage, ExportOverlay, SectionTitle, Badge, FormModal } from '../components/Ui';
 import {
   useExport, useLots, useInstruments, useFnc, useFcqDossiers, useProductionOrders,
   useUserProfile, useStockAlerts, useTRS, useDaLocal, useDaImport,
   useRhPersonnel, useRhSections, useRhAffectations,
   useMaintenanceTasks, useSupplierClassificationView,
-  useStockTransfers, getArticleUnitValue,
+  useStockTransfers, getArticleUnitValue, useForecasts, useDashboardPreferences,
 } from '../lib/hooks';
 import { useRealMRP } from '../lib/mrp';
 import { useTranslation } from '../lib/i18n';
 import AnimatedBar from '../components/AnimatedBar';
 
 type DrilldownKey = 'stock' | 'qualite' | 'mrp' | 'quarantaine' | 'production' | 'instruments' | 'fnc' | 'stockalerts' | null;
+
+// ── Styles partagés pour le bloc PDP ────────────────────────────────────────
+const pdpBadgeStyle = (pct: number): object => ({
+  paddingHorizontal: 12,
+  paddingVertical: 4,
+  borderRadius: 20,
+  backgroundColor: pct >= 90 ? C.ok : pct >= 70 ? C.gold : C.err,
+});
+const pdpBarBg: object = { height: 10, backgroundColor: '#E9ECEF', borderRadius: 5, overflow: 'hidden', marginBottom: 6 };
+const pdpBarFill: object = { height: 10, borderRadius: 5 };
+const pdpBarSub: object = { fontSize: 11, color: '#6C757D', fontWeight: '600' };
 
 // ─── Composant partagé BackButton ──────────────────────────────────────────
 function BackButton({ onPress }: { onPress: () => void }) {
@@ -23,6 +34,53 @@ function BackButton({ onPress }: { onPress: () => void }) {
       <Text style={s.backBtnText}>Retour au tableau de bord</Text>
     </TouchableOpacity>
   );
+}
+
+// ─── Personnalisation du tableau de bord (M7) ───────────────────────────────
+function useDashboardCustomizer(profile: any, sections: { key: string; label: string }[]) {
+  const userId = profile?.id;
+  const { hiddenSections, save } = useDashboardPreferences(userId);
+  const [visible, setVisible] = React.useState(false);
+  const [draft, setDraft] = React.useState<string[]>([]);
+  const hiddenKey = hiddenSections.join(',');
+  React.useEffect(() => { setDraft(hiddenSections); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [hiddenKey]);
+
+  const hiddenSet = React.useMemo(() => new Set(hiddenSections), [hiddenKey]);
+  const isHidden = (key: string) => hiddenSet.has(key);
+  const toggle = (key: string) => setDraft((d) => (d.includes(key) ? d.filter((k) => k !== key) : [...d, key]));
+
+  const button = (
+    <ActionButton label="Personnaliser" icon="cog" variant="secondary" onPress={() => { setDraft(hiddenSections); setVisible(true); }} />
+  );
+
+  const modal = (
+    <FormModal
+      visible={visible}
+      title="Personnaliser le tableau de bord"
+      onClose={() => setVisible(false)}
+      onSave={() => { save.mutate({ hidden_sections: draft }); setVisible(false); }}
+      loading={save.isPending}
+    >
+      <Text style={{ fontSize: 12, color: '#6C757D', marginBottom: 12 }}>
+        Choisissez les sections à afficher sur votre tableau de bord. Vos préférences sont enregistrées par utilisateur.
+      </Text>
+      {sections.map((sec) => {
+        const hidden = draft.includes(sec.key);
+        return (
+          <TouchableOpacity
+            key={sec.key}
+            onPress={() => toggle(sec.key)}
+            style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#F1F3F5', gap: 12 }}
+          >
+            <MaterialCommunityIcons name={hidden ? 'checkbox-blank-outline' : 'checkbox-marked'} size={22} color={hidden ? '#ADB5BD' : C.ok} />
+            <Text style={{ fontSize: 14, color: '#1A1A1A', fontWeight: '600' }}>{sec.label}</Text>
+          </TouchableOpacity>
+        );
+      })}
+    </FormModal>
+  );
+
+  return { isHidden, button, modal };
 }
 
 // ─── Header commun ──────────────────────────────────────────────────────────
@@ -167,6 +225,11 @@ function DashboardRPROD({
   const { data: maintenanceTasks = [] } = useMaintenanceTasks();
   const { results: mrpResults, runMRP, calculating: mrpLoading } = useRealMRP();
 
+  React.useEffect(() => {
+    runMRP();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const GLOBAL_ROLES = ['ADMIN', 'RQ', 'DPI', 'RPROD', 'RACH', 'PLAN'];
   const isGlobalRole = GLOBAL_ROLES.includes(profile?.role || '');
   const scopeToLineCode: Record<string, string> = {
@@ -189,9 +252,24 @@ function DashboardRPROD({
   });
 
   const now = new Date();
-  const dailyProdQty = filteredProd
-    .filter((o: any) => o.status === 'TERMINE' && o.updated_at?.startsWith(now.toISOString().split('T')[0]))
-    .reduce((acc: number, o: any) => acc + (o.qty_produced || 0), 0);
+  const todayStr = now.toISOString().split('T')[0];
+  // "Production du jour" = quantité de lots PF effectivement LIBÉRÉS par le labo
+  // aujourd'hui (et non simplement les OF clôturés) — un OF clôturé ne devient
+  // de la "vraie" production que validée par le contrôle qualité.
+  const dailyProdQty = lots
+    .filter((l: any) => {
+      if (l.article?.article_type !== 'PF') return false;
+      if (l.cqlib_status !== 'LIBERE') return false;
+      if (!l.cqlib_decided_at?.startsWith(todayStr)) return false;
+      if (userScope === 'ALL') return true;
+      const family = l.article?.family;
+      if (userScope === 'SAVON') return family === 'SIPF003';
+      if (userScope === 'PH' || userScope === 'SPAH') return family === 'SIPF009' || family === 'SPAH';
+      if (userScope === 'CORDE') return family === 'SIPF002';
+      if (userScope === 'BOU_ENC' || userScope === 'BOUGIE_ENCAUSTIQUE') return family === 'SIPF001' || family === 'SIPF004';
+      return true;
+    })
+    .reduce((acc: number, l: any) => acc + (l.qty_received || 0), 0);
 
   const enCours = filteredProd.filter((o: any) => o.status === 'EN_COURS').length;
   const planifie = filteredProd.filter((o: any) => o.status === 'PLANIFIE').length;
@@ -202,6 +280,13 @@ function DashboardRPROD({
   const quarantineCount = lots.filter(l => l.cqlib_status === 'QUARANTAINE').length;
 
   const [drilldown, setDrilldown] = React.useState<DrilldownKey>(null);
+
+  const { isHidden, button: customizeBtn, modal: customizeModal } = useDashboardCustomizer(profile, [
+    { key: 'prod_kpis', label: 'Indicateurs production' },
+    { key: 'prod_of', label: 'Ordres de fabrication' },
+    { key: 'prod_alerts', label: 'Alertes opérationnelles' },
+    { key: 'prod_mrp', label: 'Alertes MRP — réapprovisionnement' },
+  ]);
 
   if (drilldown === 'production') {
     return (
@@ -231,10 +316,11 @@ function DashboardRPROD({
           title={`Tableau de Bord — Production · ${userScope}`}
           subtitle={`${dateStr} · SIPROMAD POLE INDUSTRIEL`}
           isMobile={isMobile}
-          actions={<ActionButton label="Recalculer MRP" icon="refresh" onPress={() => runMRP()} loading={mrpLoading} />}
+          actions={<View style={{ flexDirection: 'row', gap: 8 }}><ActionButton label="Recalculer MRP" icon="refresh" onPress={() => runMRP()} loading={mrpLoading} />{customizeBtn}</View>}
         />
 
         {/* KPIs Production */}
+        {!isHidden('prod_kpis') && (
         <View style={[s.grid, isMobile && { flexDirection: 'column' }]}>
           <KpiCard label="Production du Jour" value={dailyProdQty.toLocaleString()} sub={userScope === 'PH' ? 'Balles' : 'Kg / Pcs'} color={C.gold} icon="factory" loading={prodLoading} onPress={() => setDrilldown('production')} />
           <KpiCard label="OF en cours" value={String(enCours)} sub="En fabrication" color={C.info} icon="progress-wrench" loading={prodLoading} onPress={() => setDrilldown('production')} />
@@ -250,32 +336,42 @@ function DashboardRPROD({
           />
           <KpiCard label="FNC Ouvertes" value={String(openFnc)} sub="Non-conformités actives" color={openFnc > 0 ? C.err : C.ok} icon="alert-octagon" loading={prodLoading} />
         </View>
+        )}
 
         {/* Tableau OF */}
+        {!isHidden('prod_of') && (
         <View style={{ marginTop: 32 }}>
           <SectionTitle>Ordres de Fabrication — {userScope}</SectionTitle>
-          <View style={s.card}>
-            <View style={s.tableHeader}>
-              <Text style={s.tableHeaderCell}>OF #</Text>
-              <Text style={s.tableHeaderCell}>PRODUIT</Text>
-              <Text style={s.tableHeaderCell}>QTÉ PLANIFIÉE</Text>
-              <Text style={[s.tableHeaderCell, { textAlign: 'right' }]}>STATUT</Text>
+          <ScrollView
+            horizontal={isMobile}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={isMobile ? { minWidth: 620 } : undefined}
+          >
+            <View style={s.card}>
+              <View style={s.tableHeader}>
+                <Text style={s.tableHeaderCell}>OF #</Text>
+                <Text style={s.tableHeaderCell}>PRODUIT</Text>
+                <Text style={s.tableHeaderCell}>QTÉ PLANIFIÉE</Text>
+                <Text style={[s.tableHeaderCell, { textAlign: 'right' }]}>STATUT</Text>
+              </View>
+              {filteredProd.slice(0, 8).map((o: any) => (
+                <TouchableOpacity key={o.id} style={s.tableRow} onPress={() => setDrilldown('production')}>
+                  <Text style={s.tableCellCode}>{o.code}</Text>
+                  <Text style={s.tableCellName} numberOfLines={1}>{o.product?.name || '—'}</Text>
+                  <Text style={[s.tableCellName, { textAlign: 'center' }]}>{o.qty_planned} {o.product?.unit}</Text>
+                  <View style={{ flex: 1, alignItems: 'flex-end' }}>
+                    <Badge label={o.status} color={o.status === 'TERMINE' ? C.ok : o.status === 'EN_COURS' ? C.info : C.gold} />
+                  </View>
+                </TouchableOpacity>
+              ))}
+              {filteredProd.length === 0 && <Text style={s.emptyText}>Aucun OF pour ce périmètre.</Text>}
             </View>
-            {filteredProd.slice(0, 8).map((o: any) => (
-              <TouchableOpacity key={o.id} style={s.tableRow} onPress={() => setDrilldown('production')}>
-                <Text style={s.tableCellCode}>{o.code}</Text>
-                <Text style={s.tableCellName} numberOfLines={1}>{o.product?.name || '—'}</Text>
-                <Text style={[s.tableCellName, { textAlign: 'center' }]}>{o.qty_planned} {o.product?.unit}</Text>
-                <View style={{ flex: 1, alignItems: 'flex-end' }}>
-                  <Badge label={o.status} color={o.status === 'TERMINE' ? C.ok : o.status === 'EN_COURS' ? C.info : C.gold} />
-                </View>
-              </TouchableOpacity>
-            ))}
-            {filteredProd.length === 0 && <Text style={s.emptyText}>Aucun OF pour ce périmètre.</Text>}
-          </View>
+          </ScrollView>
         </View>
+        )}
 
         {/* Alertes maintenance + quarantaine */}
+        {!isHidden('prod_alerts') && (
         <View style={{ marginTop: 32 }}>
           <SectionTitle>Alertes Opérationnelles</SectionTitle>
           <View style={[s.mainGrid, isMobile && { flexDirection: 'column' }]}>
@@ -310,9 +406,10 @@ function DashboardRPROD({
             </View>
           </View>
         </View>
+        )}
 
         {/* MRP */}
-        {mrpResults.length > 0 && (
+        {!isHidden('prod_mrp') && mrpResults.length > 0 && (
           <View style={{ marginTop: 32 }}>
             <SectionTitle>Alertes MRP — Réapprovisionnement</SectionTitle>
             <View style={s.card}>
@@ -327,13 +424,14 @@ function DashboardRPROD({
                         backgroundColor: item.priority >= 2 ? C.err : C.gold,
                       }]} />
                     </View>
-                    <Text style={s.mrpWidgetStatus}>{item.action}</Text>
+                    <Text style={s.mrpWidgetStatus}>{item.action.replace(/_/g, ' ')}</Text>
                   </View>
                 ))}
               </ScrollView>
             </View>
           </View>
         )}
+        {customizeModal}
       </ScrollView>
     </AnimatedPage>
   );
@@ -442,7 +540,12 @@ function DashboardRACH({ isMobile, dateStr }: { isMobile: boolean; dateStr: stri
   const { data: daImport = [], isPending: importLoading } = useDaImport();
   const { data: stockAlerts = [] } = useStockAlerts();
   const { data: supplierViews = [] } = useSupplierClassificationView();
-  const { results: mrpResults } = useRealMRP();
+  const { results: mrpResults, runMRP } = useRealMRP();
+
+  React.useEffect(() => {
+    runMRP();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const daLocalEnCours = (daLocal as any[]).filter((d: any) => d.status !== 'RECEPTION' && d.status !== 'ANNULE').length;
   const daLocalValidation = (daLocal as any[]).filter((d: any) => d.status === 'VALIDATION').length;
@@ -547,9 +650,22 @@ function DashboardGlobal({
   const { data: fncs = [] } = useFnc();
   const { data: prodOrders = [], isPending: prodLoading } = useProductionOrders();
   const { results: mrpResults, runMRP, calculating: mrpLoading } = useRealMRP();
+
+  React.useEffect(() => {
+    runMRP();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const { data: stockAlerts = [] } = useStockAlerts();
   const { data: stockTransfers = [], isPending: transfersLoading } = useStockTransfers();
+  const { raw: forecastRaw } = useForecasts();
   const { t } = useTranslation();
+
+  // ── Calcul PDP total (tous les objectifs de production_forecasts pour l'année en cours) ──
+  const currentYear = new Date().getFullYear();
+  const totalPDP = React.useMemo(() => {
+    return (forecastRaw as any[]).filter((r: any) => r.year === currentYear).reduce((acc: number, r: any) => acc + (r.qty || 0), 0);
+  }, [forecastRaw, currentYear]);
 
   const userScope = profile?.scope || 'ALL';
   const GLOBAL_ROLES = ['ADMIN', 'RQ', 'DPI', 'RPROD', 'RACH', 'PLAN'];
@@ -594,9 +710,24 @@ function DashboardGlobal({
   });
 
   const now = new Date();
-  const dailyProdQty = filteredProd
-    .filter((o: any) => o.status === 'TERMINE' && o.updated_at?.startsWith(now.toISOString().split('T')[0]))
-    .reduce((acc: number, o: any) => acc + (o.qty_produced || 0), 0);
+  const todayStr = now.toISOString().split('T')[0];
+  // "Production du jour" = quantité de lots PF effectivement LIBÉRÉS par le labo
+  // aujourd'hui (et non simplement les OF clôturés) — un OF clôturé ne devient
+  // de la "vraie" production que validée par le contrôle qualité.
+  const dailyProdQty = lots
+    .filter((l: any) => {
+      if (l.article?.article_type !== 'PF') return false;
+      if (l.cqlib_status !== 'LIBERE') return false;
+      if (!l.cqlib_decided_at?.startsWith(todayStr)) return false;
+      if (userScope === 'ALL') return true;
+      const family = l.article?.family;
+      if (userScope === 'SAVON') return family === 'SIPF003';
+      if (userScope === 'PH' || userScope === 'SPAH') return family === 'SIPF009' || family === 'SPAH';
+      if (userScope === 'CORDE') return family === 'SIPF002';
+      if (userScope === 'BOU_ENC' || userScope === 'BOUGIE_ENCAUSTIQUE') return family === 'SIPF001' || family === 'SIPF004';
+      return true;
+    })
+    .reduce((acc: number, l: any) => acc + (l.qty_received || 0), 0);
 
   const globalLoading = lotsLoading || prodLoading || mrpLoading;
 
@@ -642,7 +773,7 @@ function DashboardGlobal({
             <View key={f.id} style={s.drillRow}>
               <View style={{ flex: 1 }}>
                 <Text style={s.drillRowTitle}>{f.code}</Text>
-                <Text style={s.drillRowSub}>{f.lot?.code || '—'} · {f.status}</Text>
+                <Text style={s.drillRowSub}>{f.lot?.code || '—'} · {f.status?.replace(/_/g, ' ')}</Text>
               </View>
               <Badge label={f.decision || f.status} color={f.decision === 'LIBERE' ? C.ok : f.decision === 'BLOQUE' ? C.err : C.gold} />
             </View>
@@ -827,6 +958,114 @@ function DashboardGlobal({
           />
         </View>
 
+        {/* ── SECTION PDP / PLANIFICATION / PRODUCTION RÉELLE (ADMIN · DPI · PLAN) ── */}
+        {['ADMIN', 'DPI', 'PLAN'].includes(profile?.role || '') && (() => {
+          const totalPlanifie = filteredProd.reduce((acc: number, o: any) => acc + (o.qty_planned || 0), 0);
+          const totalReel = filteredProd.reduce((acc: number, o: any) => acc + (o.qty_produced || 0), 0);
+
+          const pctPdpVsPlanif  = totalPDP > 0 ? Math.min(Math.round((totalPlanifie / totalPDP) * 100), 999) : 0;
+          const pctPdpVsReel    = totalPDP > 0 ? Math.min(Math.round((totalReel      / totalPDP) * 100), 999) : 0;
+          const pctPlanifVsReel = totalPlanifie > 0 ? Math.min(Math.round((totalReel / totalPlanifie) * 100), 999) : 0;
+
+          const barColor = (pct: number) => pct >= 90 ? C.ok : pct >= 70 ? C.gold : C.err;
+
+          return (
+            <View style={{ marginTop: 32 }}>
+              <SectionTitle>Suivi PDP — Objectifs · Planification · Production Réelle</SectionTitle>
+
+              {/* 3 KPI totaux */}
+              <View style={[s.grid, { marginBottom: 20 }, isMobile && { flexDirection: 'column' }]}>
+                <KpiCard
+                  label="Total Objectif PDP"
+                  value={totalPDP.toLocaleString()}
+                  sub={`Forecast ${currentYear}`}
+                  color="#6366F1"
+                  icon="target"
+                  loading={globalLoading}
+                />
+                <KpiCard
+                  label="Total Planification (OF)"
+                  value={totalPlanifie.toLocaleString()}
+                  sub="Ordres de fabrication — Qté planifiée"
+                  color={C.info}
+                  icon="calendar-clock"
+                  loading={globalLoading}
+                />
+                <KpiCard
+                  label="Total Production Réelle"
+                  value={totalReel.toLocaleString()}
+                  sub="Qté produite (OF terminés)"
+                  color={C.ok}
+                  icon="factory"
+                  loading={globalLoading}
+                />
+              </View>
+
+              {/* Barres de taux */}
+              <View style={s.card}>
+                <Text style={[s.cardTitle, { marginBottom: 20 }]}>Taux d'Atteinte des Objectifs</Text>
+
+                {/* PDP vs Planification */}
+                <View style={{ marginBottom: 20 }}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: '#6366F1' }} />
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>PDP vs Planification OF</Text>
+                    </View>
+                    <View style={[pdpBadgeStyle(pctPdpVsPlanif)]}>
+                      <Text style={{ fontSize: 13, fontWeight: '800', color: '#FFF' }}>{pctPdpVsPlanif}%</Text>
+                    </View>
+                  </View>
+                  <View style={pdpBarBg}>
+                    <View style={[pdpBarFill, { width: `${Math.min(pctPdpVsPlanif, 100)}%`, backgroundColor: barColor(pctPdpVsPlanif) }]} />
+                  </View>
+                  <Text style={pdpBarSub}>
+                    Objectif PDP : {totalPDP.toLocaleString()} · Planifié : {totalPlanifie.toLocaleString()}
+                  </Text>
+                </View>
+
+                {/* PDP vs Production Réelle */}
+                <View style={{ marginBottom: 20 }}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: C.ok }} />
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>PDP vs Production Réelle</Text>
+                    </View>
+                    <View style={[pdpBadgeStyle(pctPdpVsReel)]}>
+                      <Text style={{ fontSize: 13, fontWeight: '800', color: '#FFF' }}>{pctPdpVsReel}%</Text>
+                    </View>
+                  </View>
+                  <View style={pdpBarBg}>
+                    <View style={[pdpBarFill, { width: `${Math.min(pctPdpVsReel, 100)}%`, backgroundColor: barColor(pctPdpVsReel) }]} />
+                  </View>
+                  <Text style={pdpBarSub}>
+                    Objectif PDP : {totalPDP.toLocaleString()} · Réel : {totalReel.toLocaleString()}
+                  </Text>
+                </View>
+
+                {/* Planification vs Production Réelle */}
+                <View>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: C.info }} />
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>Production Réelle vs Planification</Text>
+                    </View>
+                    <View style={[pdpBadgeStyle(pctPlanifVsReel)]}>
+                      <Text style={{ fontSize: 13, fontWeight: '800', color: '#FFF' }}>{pctPlanifVsReel}%</Text>
+                    </View>
+                  </View>
+                  <View style={pdpBarBg}>
+                    <View style={[pdpBarFill, { width: `${Math.min(pctPlanifVsReel, 100)}%`, backgroundColor: barColor(pctPlanifVsReel) }]} />
+                  </View>
+                  <Text style={pdpBarSub}>
+                    Planifié : {totalPlanifie.toLocaleString()} · Réel : {totalReel.toLocaleString()}
+                  </Text>
+                </View>
+              </View>
+            </View>
+          );
+        })()}
+
         <View style={[s.mainGrid, { marginTop: 32 }, isMobile && { flexDirection: 'column' }]}>
           <View style={[s.card, { flex: 2 }]}>
             <View style={s.cardHeader}>
@@ -886,98 +1125,12 @@ function DashboardGlobal({
           </View>
         </View>
 
-        <View style={{ marginTop: 32 }}>
-          <SectionTitle>{t('production')} : {userScope}</SectionTitle>
-          <View style={s.card}>
-            {filteredProd.length === 0 ? (
-              <Text style={s.emptyText}>Aucun ordre de fabrication récent pour ce périmètre.</Text>
-            ) : (
-              <View>
-                {/* En-tête fixé */}
-                <View style={s.tableHeader}>
-                  <Text style={[s.tableHeaderCell, { width: 120, flex: 0 }]}>OF #</Text>
-                  <Text style={[s.tableHeaderCell, { flex: 1 }]}>PRODUIT</Text>
-                  <Text style={[s.tableHeaderCell, { width: 130, flex: 0, textAlign: 'right' }]}>QTÉ</Text>
-                </View>
-                {/* Liste défilable verticalement */}
-                <ScrollView
-                  style={s.tableScrollArea}
-                  showsVerticalScrollIndicator={true}
-                  nestedScrollEnabled={true}
-                >
-                  {filteredProd.slice(0, 8).map((o: any) => (
-                    <TouchableOpacity key={o.id} style={s.tableRow} onPress={() => setDrilldown('production')}>
-                      <Text style={[s.tableCellCode, { width: 120, flex: 0 }]} numberOfLines={1}>{o.code}</Text>
-                      <Text style={[s.tableCellName, { flex: 1 }]} numberOfLines={1}>{o.product?.name || '—'}</Text>
-                      <View style={{ width: 130, flex: 0, alignItems: 'flex-end' }}>
-                        <View style={s.qtyBadge}>
-                          <Text style={s.qtyBadgeText}>{o.qty_planned?.toLocaleString()} {o.product?.unit}</Text>
-                        </View>
-                      </View>
-                    </TouchableOpacity>
-                  ))}
-                </ScrollView>
-              </View>
-            )}
-          </View>
-        </View>
-
-        <View style={{ marginTop: 32 }}>
-          <SectionTitle>Transferts de Stock Récents</SectionTitle>
-          <View style={s.card}>
-            {stockTransfers.length === 0 ? (
-              <Text style={s.emptyText}>Aucun transfert récent.</Text>
-            ) : (
-              <View>
-                {/* En-tête fixé */}
-                <View style={s.tableHeader}>
-                  <Text style={[s.tableHeaderCell, { width: 90, flex: 0 }]}>DATE</Text>
-                  <Text style={[s.tableHeaderCell, { flex: 1.4 }]}>ARTICLE</Text>
-                  <Text style={[s.tableHeaderCell, { flex: 1 }]}>ORIGINE</Text>
-                  <Text style={[s.tableHeaderCell, { flex: 1 }]}>DESTINATION</Text>
-                  <Text style={[s.tableHeaderCell, { width: 90, flex: 0, textAlign: 'right' }]}>QTÉ</Text>
-                </View>
-                {/* Liste défilable verticalement */}
-                <ScrollView
-                  style={s.tableScrollArea}
-                  showsVerticalScrollIndicator={true}
-                  nestedScrollEnabled={true}
-                >
-                  {stockTransfers.slice(0, 10).map((tr: any) => {
-                    const fromName = tr.depot_from?.name || tr.depot_from?.code || (tr.depot_from_id ? tr.depot_from_id.substring(0, 8) + '…' : '—');
-                    const toName   = tr.depot_to?.name   || tr.depot_to?.code   || (tr.depot_to_id   ? tr.depot_to_id.substring(0, 8)   + '…' : '—');
-                    const dateStr  = new Date(tr.created_at).toLocaleDateString('fr-FR');
-                    const qty      = tr.qty?.toLocaleString() ?? '0';
-                    const unit     = tr.article?.unit || '';
-                    return (
-                      <View key={tr.id} style={s.tableRow}>
-                        <Text style={[s.tableCellCode, { width: 90, flex: 0, fontSize: 12 }]}>{dateStr}</Text>
-                        <Text style={[s.tableCellName, { flex: 1.4 }]} numberOfLines={1}>{tr.article?.name || '—'}</Text>
-                        <View style={{ flex: 1, paddingRight: 6 }}>
-                          <View style={s.depotChip}>
-                            <MaterialCommunityIcons name="warehouse" size={11} color="#64748B" />
-                            <Text style={s.depotChipText} numberOfLines={1}>{fromName}</Text>
-                          </View>
-                        </View>
-                        <View style={{ flex: 1, paddingRight: 6 }}>
-                          <View style={[s.depotChip, { backgroundColor: '#F0FDF4', borderColor: '#BBF7D0' }]}>
-                            <MaterialCommunityIcons name="warehouse" size={11} color="#16A34A" />
-                            <Text style={[s.depotChipText, { color: '#15803D' }]} numberOfLines={1}>{toName}</Text>
-                          </View>
-                        </View>
-                        <View style={{ width: 90, flex: 0, alignItems: 'flex-end' }}>
-                          <View style={s.qtyBadge}>
-                            <Text style={s.qtyBadgeText}>{qty} {unit}</Text>
-                          </View>
-                        </View>
-                      </View>
-                    );
-                  })}
-                </ScrollView>
-              </View>
-            )}
-          </View>
-        </View>
+        {/* ── GRAPHIQUE PRODUCTION : Objectif / Planifié / Réalisé par mois ── */}
+        <ProductionChart
+          forecastRaw={forecastRaw as any[]}
+          prodOrders={prodOrders}
+          isMobile={isMobile}
+        />
 
         <View style={{ marginTop: 32 }}>
           <SectionTitle>{t('mrp_supply_analysis')}</SectionTitle>
@@ -987,27 +1140,392 @@ function DashboardGlobal({
                 <MaterialCommunityIcons name="chart-bell-curve-cumulative" size={40} color="#E9ECEF" />
                 <Text style={s.emptyText}>{t('no_mrp_alerts')}</Text>
               </View>
-            ) : (
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                {mrpResults.slice(0, 6).map(item => (
-                  <TouchableOpacity key={item.id} style={s.mrpWidget} onPress={() => setDrilldown('mrp')}>
-                    <Text style={s.mrpWidgetCode}>{item.code}</Text>
-                    <Text style={s.mrpWidgetName} numberOfLines={1}>{item.name}</Text>
-                    <View style={s.mrpWidgetBar}>
-                      <View style={[s.mrpWidgetFill, {
-                        width: `${Math.max(10, Math.min(100, (item.stock / item.needs) * 100))}%`,
-                        backgroundColor: item.priority >= 2 ? C.err : C.gold,
-                      }]} />
+            ) : (() => {
+              const top10 = [...mrpResults]
+                .sort((a, b) => b.priority - a.priority)
+                .slice(0, 10);
+              const colW = { code: 90, article: isMobile ? 160 : 220, num: 84, statut: 130 };
+              const rowMinWidth = colW.code + colW.article + colW.num * 3 + colW.statut + 16 * 5;
+              return (
+                <View>
+                  <ScrollView horizontal={isMobile} showsHorizontalScrollIndicator={isMobile}>
+                    <View style={isMobile ? { minWidth: rowMinWidth } : { flex: 1 }}>
+                      {/* En-tête tableau */}
+                      <View style={[s.tableHeader, { backgroundColor: '#F8FAFC' }]}>
+                        <Text style={[s.tableHeaderCell, { flex: isMobile ? undefined : 1.2, width: isMobile ? colW.code : undefined }]}>CODE</Text>
+                        <Text style={[s.tableHeaderCell, { flex: isMobile ? undefined : 3, width: isMobile ? colW.article : undefined }]}>ARTICLE</Text>
+                        <Text style={[s.tableHeaderCell, { flex: isMobile ? undefined : 1, width: isMobile ? colW.num : undefined, textAlign: 'right' }]}>STOCK</Text>
+                        <Text style={[s.tableHeaderCell, { flex: isMobile ? undefined : 1, width: isMobile ? colW.num : undefined, textAlign: 'right' }]}>BESOIN</Text>
+                        <Text style={[s.tableHeaderCell, { flex: isMobile ? undefined : 1, width: isMobile ? colW.num : undefined, textAlign: 'right' }]}>ÉCART</Text>
+                        <Text style={[s.tableHeaderCell, { flex: isMobile ? undefined : 1.5, width: isMobile ? colW.statut : undefined, textAlign: 'center' }]}>STATUT</Text>
+                      </View>
+
+                      {top10.map((item, idx) => {
+                        const isCritical = item.priority >= 2;
+                        const ecart = (item.stock || 0) - (item.needs || 0);
+                        const statusColor = isCritical ? '#DC3545' : '#F59E0B';
+                        const statusBg = isCritical ? '#FEF2F2' : '#FFFBEB';
+                        const statusLabel = item.action?.replace(/_/g, ' ') || 'RUPTURE RISQUE';
+                        return (
+                          <TouchableOpacity
+                            key={item.id}
+                            style={[
+                              s.tableRow,
+                              { borderLeftWidth: 3, borderLeftColor: statusColor },
+                              idx % 2 === 0 ? { backgroundColor: '#FAFBFC' } : {},
+                            ]}
+                            onPress={() => setDrilldown('mrp')}
+                          >
+                            <Text style={[s.tableCellCode, { flex: isMobile ? undefined : 1.2, width: isMobile ? colW.code : undefined }]}>{item.code}</Text>
+                            <Text
+                              style={[s.tableCellName, { flex: isMobile ? undefined : 3, width: isMobile ? colW.article : undefined }]}
+                              numberOfLines={isMobile ? 2 : 1}
+                            >
+                              {item.name}
+                            </Text>
+                            <Text style={[s.tableCellCode, { flex: isMobile ? undefined : 1, width: isMobile ? colW.num : undefined, textAlign: 'right', color: '#475569' }]}>
+                              {(item.stock || 0).toLocaleString()}
+                            </Text>
+                            <Text style={[s.tableCellCode, { flex: isMobile ? undefined : 1, width: isMobile ? colW.num : undefined, textAlign: 'right', color: '#475569' }]}>
+                              {(item.needs || 0).toLocaleString()}
+                            </Text>
+                            <Text style={[s.tableCellCode, { flex: isMobile ? undefined : 1, width: isMobile ? colW.num : undefined, textAlign: 'right', fontWeight: '700', color: ecart < 0 ? '#DC3545' : '#10B981' }]}>
+                              {ecart >= 0 ? '+' : ''}{ecart.toLocaleString()}
+                            </Text>
+                            <View style={{ flex: isMobile ? undefined : 1.5, width: isMobile ? colW.statut : undefined, alignItems: 'center' }}>
+                              <View style={{ backgroundColor: statusBg, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, borderWidth: 1, borderColor: statusColor + '40' }}>
+                                <Text style={{ fontSize: 10, fontWeight: '800', color: statusColor }}>
+                                  {statusLabel}
+                                </Text>
+                              </View>
+                            </View>
+                          </TouchableOpacity>
+                        );
+                      })}
                     </View>
-                    <Text style={s.mrpWidgetStatus}>{item.action}</Text>
+                  </ScrollView>
+
+                  {/* Bouton voir détails */}
+                  <TouchableOpacity
+                    onPress={() => setDrilldown('mrp')}
+                    style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 16, paddingVertical: 12, borderRadius: 10, borderWidth: 1.5, borderColor: '#6366F1' }}
+                  >
+                    <MaterialCommunityIcons name="chart-timeline-variant" size={18} color="#6366F1" />
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: '#6366F1' }}>
+                      Voir l'analyse MRP complète ({mrpResults.length} articles)
+                    </Text>
+                    <MaterialCommunityIcons name="arrow-right" size={16} color="#6366F1" />
                   </TouchableOpacity>
-                ))}
-              </ScrollView>
-            )}
+                </View>
+              );
+            })()}
           </View>
         </View>
       </ScrollView>
     </AnimatedPage>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// COMPOSANT : Graphique Production en courbes (Objectif / Planifié / Réalisé)
+// ════════════════════════════════════════════════════════════════════════════
+const MONTHS_FR = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Jun', 'Jul', 'Aoû', 'Sep', 'Oct', 'Nov', 'Déc'];
+const CURVE_COLORS = { objectif: '#6366F1', planifie: '#3B82F6', realise: '#10B981' };
+
+function ProductionChart({
+  forecastRaw,
+  prodOrders,
+  isMobile,
+}: {
+  forecastRaw: any[];
+  prodOrders: any[];
+  isMobile: boolean;
+}) {
+  const currentYear = new Date().getFullYear();
+  const [selectedYear, setSelectedYear] = React.useState(currentYear);
+  const [tooltip, setTooltip] = React.useState<{
+    month: number; objectif: number; planifie: number; realise: number;
+    orders: any[]; curve: 'objectif' | 'planifie' | 'realise' | null;
+  } | null>(null);
+  const [activeCurve, setActiveCurve] = React.useState<'objectif' | 'planifie' | 'realise' | null>(null);
+
+  const years = React.useMemo(() => {
+    const ys = new Set<number>([currentYear - 1, currentYear, currentYear + 1]);
+    forecastRaw.forEach(r => ys.add(r.year));
+    prodOrders.forEach((o: any) => {
+      if (o.planned_date) ys.add(new Date(o.planned_date).getFullYear());
+      if (o.created_at) ys.add(new Date(o.created_at).getFullYear());
+    });
+    return Array.from(ys).sort((a, b) => a - b);
+  }, [forecastRaw, prodOrders, currentYear]);
+
+  // Données par mois pour l'année sélectionnée
+  const monthlyData = React.useMemo(() => {
+    return Array.from({ length: 12 }, (_, i) => {
+      const month = i + 1;
+      // Objectif PDP
+      const objectif = forecastRaw
+        .filter(r => r.year === selectedYear && r.month === month)
+        .reduce((acc, r) => acc + (r.qty || 0), 0);
+
+      // OF planifiés (qty_planned) pour ce mois
+      const ofMois = prodOrders.filter((o: any) => {
+        const d = o.planned_date || o.created_at;
+        if (!d) return false;
+        const dt = new Date(d);
+        return dt.getFullYear() === selectedYear && (dt.getMonth() + 1) === month;
+      });
+      const planifie = ofMois.reduce((acc: number, o: any) => acc + (o.qty_planned || 0), 0);
+
+      // OF terminés (qty_produced) pour ce mois — statut TERMINE ou CLOTURE
+      const ofTermines = prodOrders.filter((o: any) => {
+        if (o.status !== 'TERMINE' && o.status !== 'CLOTURE') return false;
+        const d = o.updated_at || o.planned_date;
+        if (!d) return false;
+        const dt = new Date(d);
+        return dt.getFullYear() === selectedYear && (dt.getMonth() + 1) === month;
+      });
+      const realise = ofTermines.reduce((acc: number, o: any) => acc + (o.qty_produced || 0), 0);
+
+      return { month, objectif, planifie, realise, orders: ofMois };
+    });
+  }, [forecastRaw, prodOrders, selectedYear]);
+
+  const maxVal = React.useMemo(() => {
+    const vals = monthlyData.flatMap(d => [d.objectif, d.planifie, d.realise]);
+    return Math.max(...vals, 1);
+  }, [monthlyData]);
+
+  // Dimensions SVG web
+  const W = isMobile ? 380 : 960;
+  const H = 300;
+  const PAD = { top: 30, right: 30, bottom: 44, left: 72 };
+  const chartW = W - PAD.left - PAD.right;
+  const chartH = H - PAD.top - PAD.bottom;
+
+  const xPos = (i: number) => PAD.left + (i / 11) * chartW;
+  const yPos = (v: number) => PAD.top + chartH - (v / maxVal) * chartH;
+
+  // Courbe lisse via Bézier cubique (tension 0.4)
+  const buildPath = (key: 'objectif' | 'planifie' | 'realise') => {
+    const pts = monthlyData.map((d, i) => ({ x: xPos(i), y: yPos(d[key]) }));
+    if (pts.length < 2) return '';
+    let d = `M ${pts[0].x} ${pts[0].y}`;
+    for (let i = 1; i < pts.length; i++) {
+      const prev = pts[i - 1];
+      const curr = pts[i];
+      const cpX = (curr.x - prev.x) * 0.4;
+      d += ` C ${prev.x + cpX} ${prev.y}, ${curr.x - cpX} ${curr.y}, ${curr.x} ${curr.y}`;
+    }
+    return d;
+  };
+
+  const yTicks = React.useMemo(() => {
+    const steps = 6;
+    return Array.from({ length: steps + 1 }, (_, i) => Math.round((i / steps) * maxVal));
+  }, [maxVal]);
+
+  const formatY = (v: number) => {
+    if (v === 0) return '0';
+    if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+    if (v >= 10_000) return `${Math.round(v / 1_000)}k`;
+    if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
+    return v.toLocaleString();
+  };
+
+  const handlePointPress = (d: typeof monthlyData[0], curve: 'objectif' | 'planifie' | 'realise') => {
+    if (tooltip?.month === d.month && tooltip?.curve === curve) {
+      setTooltip(null);
+    } else {
+      setTooltip({ ...d, curve });
+      setActiveCurve(curve);
+    }
+  };
+
+  return (
+    <View style={{ marginTop: 32 }}>
+      <SectionTitle>Production — Objectif · Planifié · Réalisé</SectionTitle>
+      <View style={[s.card, { padding: 0 }]}>
+
+        {/* Header avec filtre année */}
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderBottomWidth: 1, borderBottomColor: '#F1F5F9' }}>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: '#1E293B' }}>
+            Suivi mensuel {selectedYear}
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 6 }}>
+            {years.map(y => (
+              <TouchableOpacity
+                key={y}
+                onPress={() => { setSelectedYear(y); setTooltip(null); }}
+                style={{
+                  paddingHorizontal: 12, paddingVertical: 5, borderRadius: 20,
+                  backgroundColor: y === selectedYear ? '#6366F1' : '#F1F5F9',
+                }}
+              >
+                <Text style={{ fontSize: 12, fontWeight: '700', color: y === selectedYear ? '#FFF' : '#64748B' }}>
+                  {y}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        {/* Légende cliquable */}
+        <View style={{ flexDirection: 'row', gap: 20, paddingHorizontal: 16, paddingTop: 12 }}>
+          {(['objectif', 'planifie', 'realise'] as const).map(k => (
+            <TouchableOpacity
+              key={k}
+              onPress={() => setActiveCurve(activeCurve === k ? null : k)}
+              style={{ flexDirection: 'row', alignItems: 'center', gap: 6, opacity: activeCurve && activeCurve !== k ? 0.35 : 1 }}
+            >
+              <View style={{ width: 24, height: 3, borderRadius: 2, backgroundColor: CURVE_COLORS[k] }} />
+              <Text style={{ fontSize: 12, fontWeight: '600', color: '#475569' }}>
+                {k === 'objectif' ? 'Objectif PDP' : k === 'planifie' ? 'Planifié (OF)' : 'Réalisé'}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {/* SVG Graphique */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          <View style={{ width: W, height: H + 10, paddingBottom: 8 }}>
+            <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
+              {/* Grille verticale légère */}
+              {monthlyData.map((_, i) => (
+                <line key={`vg-${i}`} x1={xPos(i)} y1={PAD.top} x2={xPos(i)} y2={H - PAD.bottom}
+                  stroke="#F1F5F9" strokeWidth="1" />
+              ))}
+              {/* Grille horizontale */}
+              {yTicks.map((tick, ti) => (
+                <g key={`tick-${ti}`}>
+                  <line
+                    x1={PAD.left} y1={yPos(tick)} x2={W - PAD.right} y2={yPos(tick)}
+                    stroke="#E2E8F0" strokeWidth="1" strokeDasharray="4,3"
+                  />
+                  <text x={PAD.left - 10} y={yPos(tick) + 4} textAnchor="end" fontSize="11" fill="#64748B" fontWeight="500">
+                    {formatY(tick)}
+                  </text>
+                </g>
+              ))}
+
+              {/* Labels mois X */}
+              {MONTHS_FR.map((m, i) => (
+                <text key={m} x={xPos(i)} y={H - 8} textAnchor="middle" fontSize="11" fill="#64748B" fontWeight="600">{m}</text>
+              ))}
+
+              {/* Axe Y */}
+              <line x1={PAD.left} y1={PAD.top} x2={PAD.left} y2={H - PAD.bottom} stroke="#E2E8F0" strokeWidth="1" />
+
+              {/* Courbes */}
+              {(['objectif', 'planifie', 'realise'] as const).map(k => (
+                <path
+                  key={k}
+                  d={buildPath(k)}
+                  fill="none"
+                  stroke={CURVE_COLORS[k]}
+                  strokeWidth={activeCurve && activeCurve !== k ? 1.5 : 3}
+                  opacity={activeCurve && activeCurve !== k ? 0.2 : 1}
+                />
+              ))}
+
+              {/* Points cliquables */}
+              {monthlyData.map((d, i) => (
+                <g key={`pts-${i}`}>
+                  {(['objectif', 'planifie', 'realise'] as const).map(k => {
+                  const isSelected = tooltip?.month === d.month && tooltip?.curve === k;
+                  const isDimmed = activeCurve && activeCurve !== k;
+                  return (
+                    <circle
+                      key={k}
+                      cx={xPos(i)}
+                      cy={yPos(d[k])}
+                      r={isSelected ? 7 : 4}
+                      fill={isSelected ? CURVE_COLORS[k] : '#FFF'}
+                      stroke={CURVE_COLORS[k]}
+                      strokeWidth={isSelected ? 0 : 2}
+                      opacity={isDimmed ? 0.2 : 1}
+                      style={{ cursor: 'pointer' }}
+                      onClick={() => handlePointPress(d, k)}
+                    />
+                  );
+                })}
+                </g>
+              ))}
+            </svg>
+          </View>
+        </ScrollView>
+
+        {/* Tooltip détails */}
+        {tooltip && (
+          <View style={{ margin: 16, marginTop: 0, padding: 16, backgroundColor: '#F8FAFC', borderRadius: 12, borderWidth: 1, borderColor: '#E2E8F0' }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: CURVE_COLORS[tooltip.curve!] }} />
+                <Text style={{ fontSize: 14, fontWeight: '800', color: '#1E293B' }}>
+                  {MONTHS_FR[tooltip.month - 1]} {selectedYear} — {tooltip.curve === 'objectif' ? 'Objectif PDP' : tooltip.curve === 'planifie' ? 'Planifié (OF)' : 'Réalisé'}
+                </Text>
+              </View>
+              <TouchableOpacity onPress={() => setTooltip(null)}>
+                <MaterialCommunityIcons name="close" size={18} color="#94A3B8" />
+              </TouchableOpacity>
+            </View>
+
+            {/* 3 valeurs */}
+            <View style={{ flexDirection: 'row', gap: 12, marginBottom: 16 }}>
+              {(['objectif', 'planifie', 'realise'] as const).map(k => (
+                <View key={k} style={{ flex: 1, padding: 10, backgroundColor: tooltip.curve === k ? CURVE_COLORS[k] + '15' : '#FFF', borderRadius: 8, borderWidth: 1, borderColor: tooltip.curve === k ? CURVE_COLORS[k] + '40' : '#E2E8F0', alignItems: 'center' }}>
+                  <Text style={{ fontSize: 10, fontWeight: '700', color: '#94A3B8', marginBottom: 4 }}>
+                    {k === 'objectif' ? 'OBJECTIF' : k === 'planifie' ? 'PLANIFIÉ' : 'RÉALISÉ'}
+                  </Text>
+                  <Text style={{ fontSize: 18, fontWeight: '800', color: CURVE_COLORS[k] }}>
+                    {tooltip[k].toLocaleString()}
+                  </Text>
+                </View>
+              ))}
+            </View>
+
+            {/* OF du mois */}
+            {tooltip.orders.length > 0 ? (
+              <View>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: '#64748B', marginBottom: 8 }}>
+                  ORDRES DE FABRICATION ({tooltip.orders.length})
+                </Text>
+                {tooltip.orders.slice(0, 5).map((o: any) => (
+                  <View key={o.id} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 6, borderTopWidth: 1, borderTopColor: '#F1F5F9', gap: 10 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: '#475569', width: 110 }}>{o.code}</Text>
+                    <Text style={{ flex: 1, fontSize: 12, color: '#64748B' }} numberOfLines={1}>{o.product?.name || '—'}</Text>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      <Text style={{ fontSize: 11, color: CURVE_COLORS.planifie, fontWeight: '700' }}>
+                        P: {(o.qty_planned || 0).toLocaleString()}
+                      </Text>
+                      {o.status === 'TERMINE' && (
+                        <Text style={{ fontSize: 11, color: CURVE_COLORS.realise, fontWeight: '700' }}>
+                          R: {(o.qty_produced || 0).toLocaleString()}
+                        </Text>
+                      )}
+                    </View>
+                    <View style={{ paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, backgroundColor: o.status === 'TERMINE' ? '#D1FAE5' : o.status === 'EN_COURS' ? '#DBEAFE' : '#FEF3C7' }}>
+                      <Text style={{ fontSize: 10, fontWeight: '700', color: o.status === 'TERMINE' ? '#065F46' : o.status === 'EN_COURS' ? '#1D4ED8' : '#92400E' }}>
+                        {o.status}
+                      </Text>
+                    </View>
+                  </View>
+                ))}
+                {tooltip.orders.length > 5 && (
+                  <Text style={{ fontSize: 11, color: '#94A3B8', marginTop: 6, textAlign: 'center' }}>
+                    + {tooltip.orders.length - 5} autres OF ce mois
+                  </Text>
+                )}
+              </View>
+            ) : (
+              <Text style={{ fontSize: 12, color: '#94A3B8', fontStyle: 'italic' }}>
+                Aucun ordre de fabrication pour {MONTHS_FR[tooltip.month - 1]} {selectedYear}
+              </Text>
+            )}
+          </View>
+        )}
+      </View>
+    </View>
   );
 }
 

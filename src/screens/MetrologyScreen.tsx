@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { ScrollView, StyleSheet, Text, View, TouchableOpacity, ActivityIndicator, Alert, useWindowDimensions } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { C, KpiCard, AnimatedPage, Badge, ActionButton, FormModal, FormInput } from '../components/Ui';
+import { C, KpiCard, AnimatedPage, Badge, ActionButton, FormModal, FormInput, confirmShow } from '../components/Ui';
 import { useInstruments } from '../lib/hooks';
 import { useTranslation } from '../lib/i18n';
 import { supabase } from '../lib/supabase';
@@ -182,6 +182,26 @@ export function MetrologyScreen() {
     }
   };
 
+  const handleDeleteInstrument = (inst: any) => {
+    confirmShow(
+      'Supprimer l\'instrument',
+      `Supprimer "${inst.code} — ${inst.name}" ?\n\nLe journal d'étalonnage associé sera également supprimé.`,
+      async () => {
+        if (!supabase) return;
+        try {
+          await supabase.from('calibration_log').delete().eq('instrument_id', inst.id);
+          const { error } = await supabase.from('instruments').delete().eq('id', inst.id);
+          if (error) throw error;
+          queryClient.invalidateQueries({ queryKey: ['instruments'] });
+        } catch (err: any) {
+          Alert.alert('Erreur', err.message || 'Suppression impossible');
+        }
+      },
+      undefined,
+      true
+    );
+  };
+
   return (
     <AnimatedPage>
       <ScrollView style={s.container} contentContainerStyle={s.content}>
@@ -209,12 +229,14 @@ export function MetrologyScreen() {
             ) : (
               <View style={s.tableCard}>
                 <View style={[s.tr, { backgroundColor: '#F8F9FA', borderBottomWidth: 2, borderBottomColor: '#E9ECEF' }]}>
-                  <Text style={[s.th, { flex: 1.2 }]}>Code</Text>
-                  <Text style={[s.th, { flex: 2 }]}>Instrument</Text>
-                  <Text style={[s.th, { flex: 1 }]}>Dernier Test</Text>
-                  <Text style={[s.th, { flex: 1 }]}>Date Limite</Text>
-                  <Text style={[s.th, { flex: 1, textAlign: 'right' }]}>Tolérance</Text>
-                  <Text style={[s.th, { flex: 0.8, textAlign: 'right' }]}>Action</Text>
+                  <Text style={[s.th, { flex: 1.2 }]}>CODE</Text>
+                  <Text style={[s.th, { flex: 2 }]}>DÉSIGNATION</Text>
+                  <Text style={[s.th, { flex: 1 }]}>DERNIER TEST</Text>
+                  <Text style={[s.th, { flex: 1 }]}>PROCHAINE ÉCHÉANCE</Text>
+                  <Text style={[s.th, { flex: 1, textAlign: 'right' }]}>TOLÉRANCE</Text>
+                  <View style={{ width: 88, alignItems: 'flex-end' }}>
+                    <Text style={s.th}>ACTIONS</Text>
+                  </View>
                 </View>
                 {instruments.map((inst: any, idx: number) => (
                   <View key={inst.id} style={[s.tr, idx === instruments.length - 1 && { borderBottomWidth: 0 }]}>
@@ -228,12 +250,23 @@ export function MetrologyScreen() {
                       {inst.next_calibration_at ? new Date(inst.next_calibration_at).toLocaleDateString('fr-FR') : '—'}
                     </Text>
                     <Text style={[s.td, { flex: 1, textAlign: 'right', fontWeight: '700' }]}>± {inst.tolerance || 0.05} g</Text>
-                    <View style={{ flex: 0.8, alignItems: 'flex-end' }}>
+                    <View style={{ width: 88, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 6 }}>
+                      {/* Bouton Étalonner */}
                       <ActionButton
-                        label="Étalonner"
+                        label=""
                         icon="calculator"
+                        iconOnly
                         variant="secondary"
                         onPress={() => handleStartCalibration(inst)}
+                      />
+                      {/* Bouton Supprimer */}
+                      <ActionButton
+                        label=""
+                        icon="trash-can-outline"
+                        iconOnly
+                        variant="secondary"
+                        color={C.err}
+                        onPress={() => handleDeleteInstrument(inst)}
                       />
                     </View>
                   </View>

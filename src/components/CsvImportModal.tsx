@@ -15,14 +15,22 @@ interface CsvImportModalProps {
 
 export function CsvImportModal({ visible, onClose, onSuccess, type }: CsvImportModalProps) {
   const [loading, setLoading] = React.useState(false);
+  const [progress, setProgress] = React.useState(0);
   const [data, setData] = React.useState<any[]>([]);
   const [headers, setHeaders] = React.useState<string[]>([]);
+
+  const handleClose = () => {
+    setData([]);
+    setProgress(0);
+    onClose();
+  };
 
   const handlePickFile = async () => {
     try {
       const file = await pickSpreadsheet();
       if (!file) return;
 
+      setProgress(0);
       const response = await fetch(file.uri);
       const csvString = await response.text();
 
@@ -47,12 +55,9 @@ export function CsvImportModal({ visible, onClose, onSuccess, type }: CsvImportM
     if (data.length === 0) return;
 
     setLoading(true);
+    setProgress(0);
     try {
-      // Mapping technique selon le type
       const table = (type === 'mp' || type === 'pf') ? 'articles' : type === 'suppliers' ? 'suppliers' : 'depots';
-      
-      // Préparation des données (on s'assure que les colonnes matchent la DB)
-      // On force article_type selon l'onglet courant
       const processed = data.map(item => {
         const clean: any = { ...item };
         if (type === 'mp') clean.article_type = 'MP';
@@ -61,15 +66,22 @@ export function CsvImportModal({ visible, onClose, onSuccess, type }: CsvImportM
         return clean;
       });
 
-      const { error } = await (supabase as any)
-        .from(table)
-        .upsert(processed, { onConflict: 'code' });
+      const chunkSize = 50;
+      let imported = 0;
+      for (let i = 0; i < processed.length; i += chunkSize) {
+        const chunk = processed.slice(i, i + chunkSize);
+        const { error } = await (supabase as any)
+          .from(table)
+          .upsert(chunk, { onConflict: 'code' });
+        if (error) throw error;
+        imported += chunk.length;
+        setProgress(imported / processed.length);
+      }
 
-      if (error) throw error;
-
+      setProgress(1);
       Alert.alert('Succès', `${data.length} enregistrements importés avec succès.`);
       onSuccess();
-      onClose();
+      handleClose();
     } catch (error: any) {
       console.error(error);
       Alert.alert('Erreur Import', error.message);
@@ -84,7 +96,7 @@ export function CsvImportModal({ visible, onClose, onSuccess, type }: CsvImportM
         <View style={s.modal}>
           <View style={s.header}>
             <Text style={s.title}>Importation CSV ({type === 'mp' ? 'Matières Premières' : type === 'pf' ? 'Produits Finis' : type})</Text>
-            <TouchableOpacity onPress={onClose}>
+            <TouchableOpacity onPress={handleClose}>
               <MaterialCommunityIcons name="close" size={24} color="#666" />
             </TouchableOpacity>
           </View>
@@ -128,7 +140,7 @@ export function CsvImportModal({ visible, onClose, onSuccess, type }: CsvImportM
                 <View style={s.actions}>
                   <ActionButton 
                     label="Recommencer" 
-                    onPress={() => setData([])} 
+                    onPress={() => { setData([]); setProgress(0); }} 
                     variant="secondary" 
                   />
                   <ActionButton 
@@ -137,8 +149,17 @@ export function CsvImportModal({ visible, onClose, onSuccess, type }: CsvImportM
                     onPress={handleImport} 
                     variant="primary" 
                     loading={loading}
+                    progress={progress > 0 && progress < 1 ? progress : undefined}
                   />
                 </View>
+                {progress > 0 && progress < 1 && (
+                  <View style={s.csvProgress}>
+                    <Text style={s.csvProgressText}>{`Importation ${Math.round(progress * 100)}%`}</Text>
+                    <View style={s.csvProgressBarBackground}>
+                      <View style={[s.csvProgressBarFill, { width: `${Math.round(progress * 100)}%` }]} />
+                    </View>
+                  </View>
+                )}
               </View>
             )}
           </ScrollView>
@@ -165,4 +186,8 @@ const s = StyleSheet.create({
   cell: { flex: 1, fontSize: 11, color: '#444' },
   more: { fontSize: 12, color: '#999', textAlign: 'center', marginTop: 10, fontStyle: 'italic' },
   actions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 12, marginTop: 24, borderTopWidth: 1, borderTopColor: '#EEE', paddingTop: 20 },
+  csvProgress: { marginTop: 16 },
+  csvProgressText: { fontSize: 12, color: '#475569', marginBottom: 6, fontWeight: '700' },
+  csvProgressBarBackground: { height: 8, backgroundColor: '#E9ECEF', borderRadius: 4, overflow: 'hidden' },
+  csvProgressBarFill: { height: '100%', backgroundColor: C.info },
 });

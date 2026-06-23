@@ -62,7 +62,9 @@ export function InstrumentsScreen() {
           Alert.alert('Erreur', err?.message || 'Échec suppression');
         }
       }
-    );
+    ,
+    'danger'
+  );
   };
 
   const canManage = ['ADMIN', 'RQ', 'TLAB'].includes(role || '');

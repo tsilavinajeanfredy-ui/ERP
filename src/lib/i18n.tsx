@@ -114,7 +114,7 @@ export function LanguageProvider({ children }: { children: React.ReactNode }) {
       supabase
         .from('custom_translations')
         .select('*')
-        .then(({ data, error }) => {
+        .then(({ data, error }: { data: any; error: any }) => {
           if (data && !error) {
             const loadedFR: Record<string, string> = {};
             const loadedEN: Record<string, string> = {};

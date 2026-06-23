@@ -17,6 +17,16 @@ const ACTION_CONFIG = {
   DELETE: { color: '#DC2626', bg: '#FEF2F2', border: '#FECACA', icon: 'minus-circle',   label: 'SUPPRESSION'  },
 } as const;
 
+// Filtre spécial décisions laboratoire
+const LABO_FILTER = 'LABO';
+const LABO_CONFIG = { color: '#7C3AED', bg: '#F5F3FF', border: '#C4B5FD', icon: 'flask-outline', label: 'DÉCISIONS LABO' };
+
+function isLaboDecision(log: any): boolean {
+  if (log.table_name !== 'lots' || log.action !== 'UPDATE') return false;
+  const newStatus = log.new_data?.cqlib_status;
+  return newStatus === 'LIBERE' || newStatus === 'BLOQUE';
+}
+
 type ActionType = keyof typeof ACTION_CONFIG;
 
 const TABLE_LABELS: Record<string, string> = {
@@ -271,13 +281,22 @@ function DetailModal({ log, onClose }: { log: any; onClose: () => void }) {
                 { label: 'Utilisateur', value: log.user?.full_name || log.user?.email || 'Système', icon: 'account' },
                 { label: 'Date', value: `${date} à ${time}`, icon: 'calendar-clock' },
                 { label: 'Table', value: getTableLabel(log.table_name), icon: 'table' },
-                { label: 'ID Enregistrement', value: log.record_id, icon: 'identifier', mono: true },
+                { label: 'ID Enregistrement', value: log.record_id, icon: 'identifier', isId: true },
               ].map(item => (
                 <View key={item.label} style={ds.modalInfoRow}>
-                  <MaterialCommunityIcons name={item.icon as any} size={15} color="#9CA3AF" />
-                  <View style={{ flex: 1, marginLeft: 8 }}>
+                  <View style={ds.modalInfoIconBox}>
+                    <MaterialCommunityIcons name={item.icon as any} size={14} color="#6B7280" />
+                  </View>
+                  <View style={{ flex: 1, marginLeft: 10 }}>
                     <Text style={ds.modalInfoLabel}>{item.label}</Text>
-                    <Text style={[ds.modalInfoValue, item.mono && ds.mono]}>{item.value}</Text>
+                    {(item as any).isId ? (
+                      <View style={ds.idBox}>
+                        <Text style={ds.idBoxShort}>{(item.value as string)?.split('-')[0]?.toUpperCase()}</Text>
+                        <Text style={ds.idBoxFull} numberOfLines={1} ellipsizeMode="middle">{item.value as string}</Text>
+                      </View>
+                    ) : (
+                      <Text style={ds.modalInfoValue}>{item.value as string}</Text>
+                    )}
                   </View>
                 </View>
               ))}
@@ -344,15 +363,45 @@ export function AuditScreen() {
   const { width } = useWindowDimensions();
   const isMobile = width < 640;
 
-  const [filter, setFilter] = React.useState<'ALL' | ActionType>('ALL');
+  const [filter, setFilter] = React.useState<'ALL' | ActionType | 'LABO'>('ALL');
   const [selectedLog, setSelectedLog] = React.useState<any | null>(null);
   const [page, setPage] = React.useState(0);
   const { data: logResponse, isPending: loading } = useAuditLogs(page, 20);
   const logs = (logResponse as any)?.data || [];
   const totalCount = (logResponse as any)?.count || 0;
 
+  // ── Badge nouveaux audits ──────────────────────────────────────────────────
+  const SEEN_KEY = 'erp_audit_seen_ids_v1';
+  const seenAuditIds = React.useRef<Set<string>>(new Set());
+  const [newAuditCount, setNewAuditCount] = React.useState(0);
+
+  React.useEffect(() => {
+    try {
+      const raw = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SEEN_KEY) : null;
+      if (raw) seenAuditIds.current = new Set(JSON.parse(raw));
+    } catch (e) {}
+  }, []);
+
+  React.useEffect(() => {
+    if (!logs.length) return;
+    const unseen = logs.filter((l: any) => !seenAuditIds.current.has(l.id));
+    setNewAuditCount(unseen.length);
+  }, [logs]);
+
+  const markAllSeen = React.useCallback(() => {
+    logs.forEach((l: any) => seenAuditIds.current.add(l.id));
+    try {
+      if (typeof sessionStorage !== 'undefined')
+        sessionStorage.setItem(SEEN_KEY, JSON.stringify(Array.from(seenAuditIds.current)));
+    } catch (e) {}
+    setNewAuditCount(0);
+  }, [logs]);
+
   const filteredLogs = logs.filter((log: any) => {
-    const matchesAction = filter === 'ALL' || log.action === filter;
+    const matchesAction =
+      filter === 'ALL' ? true :
+      filter === LABO_FILTER ? isLaboDecision(log) :
+      log.action === filter;
     const q = searchQuery.toLowerCase();
     const matchesSearch = !q
       || log.table_name?.toLowerCase().includes(q)
@@ -361,6 +410,8 @@ export function AuditScreen() {
       || log.record_id?.toLowerCase().includes(q);
     return matchesAction && matchesSearch;
   });
+
+  const laboCount = logs.filter((l: any) => isLaboDecision(l)).length;
 
   const handleExportPdf = () => {
     const tableRows = filteredLogs.map((log: any) => `
@@ -393,13 +444,21 @@ export function AuditScreen() {
 
   return (
     <AnimatedPage>
-      <ScrollView style={ds.container} contentContainerStyle={ds.content} showsVerticalScrollIndicator={false}>
+      <ScrollView style={ds.container} contentContainerStyle={ds.content} showsVerticalScrollIndicator={false} onScrollBeginDrag={markAllSeen}>
 
         {/* ── Header ── */}
         <View style={[ds.header, isMobile && { flexDirection: 'column', gap: 12 }]}>
-          <View>
-            <Text style={ds.title}>Journal d'Audit</Text>
-            <Text style={ds.subtitle}>Traçabilité complète · Toutes les actions enregistrées</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <View>
+              <Text style={ds.title}>Journal d'Audit</Text>
+              <Text style={ds.subtitle}>Traçabilité complète · Toutes les actions enregistrées</Text>
+            </View>
+            {newAuditCount > 0 && (
+              <TouchableOpacity onPress={markAllSeen} style={ds.newBadge}>
+                <MaterialCommunityIcons name="bell-ring" size={13} color="#FFF" />
+                <Text style={ds.newBadgeText}>{newAuditCount} nouveau{newAuditCount > 1 ? 'x' : ''}</Text>
+              </TouchableOpacity>
+            )}
           </View>
           <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center' }}>
             <View style={ds.countBadge}>
@@ -442,6 +501,21 @@ export function AuditScreen() {
               </TouchableOpacity>
             );
           })}
+          {/* Filtre LABO */}
+          <TouchableOpacity
+            style={[ds.filterBtn, filter === LABO_FILTER && { backgroundColor: LABO_CONFIG.bg, borderColor: LABO_CONFIG.border }]}
+            onPress={() => setFilter(filter === LABO_FILTER ? 'ALL' : LABO_FILTER as any)}
+          >
+            <MaterialCommunityIcons name={LABO_CONFIG.icon as any} size={14} color={filter === LABO_FILTER ? LABO_CONFIG.color : '#9CA3AF'} />
+            <Text style={[ds.filterBtnText, filter === LABO_FILTER && { color: LABO_CONFIG.color, fontWeight: '700' }]}>
+              Décisions Labo
+            </Text>
+            {laboCount > 0 && (
+              <View style={[ds.filterCount, filter === LABO_FILTER && { backgroundColor: LABO_CONFIG.color }]}>
+                <Text style={[ds.filterCountText, filter === LABO_FILTER && { color: '#FFF' }]}>{laboCount}</Text>
+              </View>
+            )}
+          </TouchableOpacity>
         </View>
 
         {/* ── Liste des logs ── */}
@@ -538,6 +612,10 @@ const ds = StyleSheet.create({
   insertFieldKey: { fontWeight: '600', color: '#6B7280' },
   insertFieldVal: { color: '#111827' },
 
+  // Badge nouveaux audits
+  newBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#7C3AED', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20 },
+  newBadgeText: { fontSize: 12, fontWeight: '700', color: '#FFF' },
+
   // Footer de card
   cardFooter: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6, paddingTop: 8, borderTopWidth: 1, borderTopColor: '#F3F4F6' },
   cardFooterText: { fontSize: 11, color: '#D1D5DB' },
@@ -564,9 +642,13 @@ const ds = StyleSheet.create({
   modalSection: { padding: 20, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' },
   modalSectionTitle: { fontSize: 10, fontWeight: '800', color: '#9CA3AF', letterSpacing: 1, marginBottom: 14 },
   modalInfoGrid: { gap: 12 },
-  modalInfoRow: { flexDirection: 'row', alignItems: 'flex-start' },
-  modalInfoLabel: { fontSize: 11, color: '#9CA3AF', fontWeight: '500' },
-  modalInfoValue: { fontSize: 13, color: '#111827', fontWeight: '600', marginTop: 2 },
+  modalInfoRow: { flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#F9FAFB' },
+  modalInfoIconBox: { width: 28, height: 28, borderRadius: 8, backgroundColor: '#F3F4F6', alignItems: 'center', justifyContent: 'center', marginTop: 2 },
+  modalInfoLabel: { fontSize: 10, color: '#9CA3AF', fontWeight: '700', letterSpacing: 0.5, textTransform: 'uppercase', marginBottom: 3 },
+  modalInfoValue: { fontSize: 13, color: '#111827', fontWeight: '600' },
+  idBox: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 },
+  idBoxShort: { backgroundColor: '#1E3A5F', color: '#FFF', fontSize: 11, fontWeight: '800', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, fontFamily: 'monospace', letterSpacing: 0.5 },
+  idBoxFull: { fontSize: 11, color: '#9CA3AF', flex: 1, fontFamily: 'monospace' },
   mono: { fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 12 },
 
   // Diff
@@ -581,9 +663,9 @@ const ds = StyleSheet.create({
 
   // JSON block
   jsonBlock: { gap: 6 },
-  jsonRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' },
-  jsonKey: { fontSize: 12, fontWeight: '600', color: '#6B7280', textTransform: 'capitalize', flex: 1 },
-  jsonVal: { fontSize: 12, color: '#111827', flex: 2, textAlign: 'right' },
+  jsonRow: { paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' },
+  jsonKey: { fontSize: 11, fontWeight: '700', color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 3 },
+  jsonVal: { fontSize: 13, color: '#111827', fontWeight: '500' },
 
   // Close button
   modalCloseBtn: { margin: 16, paddingVertical: 14, backgroundColor: '#111827', borderRadius: 12, alignItems: 'center' },

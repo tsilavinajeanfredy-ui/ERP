@@ -25,7 +25,24 @@ interface AttachedDocument {
 
 const STEP_MAP: Record<string, number> = {
   'DA_VALIDEE': 0, 'PROFORMA': 1, 'LC_VIREMENT': 2, 'EXPEDITION': 3,
-  'CONNAISSEMENT': 4, 'DEDOUANEMENT': 5, 'ETA': 6, 'RECEPTION': 7,
+  'CONNAISSEMENT': 4, 'DEDOUANEMENT': 5, 'ETA': 6,
+  'ARRIVEE_TAMATAVE': 7, // Arrivée physique au port de Tamatave
+  'ARRIVEE_USINE': 8,    // Livraison physique à l'usine
+  'RECEPTION': 9,
+};
+
+// Labels lisibles pour les jalons
+const STEP_LABELS: Record<string, string> = {
+  DA_VALIDEE: 'DA Validée',
+  PROFORMA: 'Proforma',
+  LC_VIREMENT: 'LC / Virement',
+  EXPEDITION: 'Expédition',
+  CONNAISSEMENT: 'Connaissement',
+  DEDOUANEMENT: 'Dédouanement',
+  ETA: 'ETA (prévisionnelle)',
+  ARRIVEE_TAMATAVE: 'Arrivée Tamatave',
+  ARRIVEE_USINE: 'Arrivée Usine',
+  RECEPTION: 'Réception',
 };
 
 export function PurchasingImportScreen({ navigation }: any) {
@@ -58,7 +75,7 @@ export function PurchasingImportScreen({ navigation }: any) {
           <tbody>
             <tr><td>Quantité (kg)</td><td class="text-right">${da.qty_kg}</td></tr>
             <tr><td>Montant Devise</td><td class="text-right">${da.amount_currency} ${da.currency}</td></tr>
-            <tr><td>Délai (jours)</td><td class="text-right">${da.lead_time_days}</td></tr>
+            <tr><td>Délai (jours)</td><td class="text-right">${da.lead_time_days != null ? da.lead_time_days : '—'}</td></tr>
             <tr><td>ETA</td><td class="text-right">${da.eta_date || 'Non défini'}</td></tr>
             <tr><td>Statut Actuel</td><td class="text-right">${da.status}</td></tr>
           </tbody>
@@ -78,7 +95,10 @@ export function PurchasingImportScreen({ navigation }: any) {
 
   const IMPORT_STEPS = [
     t('step_da_valid'), t('step_proforma'), t('step_lc'), t('step_shipping'),
-    t('step_bl'), t('step_customs'), t('step_eta'), t('step_reception')
+    t('step_bl'), t('step_customs'), t('step_eta'),
+    'Arrivée Tamatave', // Jalon physique port
+    'Arrivée Usine',    // Jalon livraison usine
+    t('step_reception')
   ];
 
   const { profile } = useUserProfile();
@@ -90,6 +110,8 @@ export function PurchasingImportScreen({ navigation }: any) {
   const { data: exchangeRates = [] } = useExchangeRates(); // Récupération des taux de change
   const queryClient = useQueryClient(); // Get query client for invalidation
   const [selId, setSelId] = React.useState<string | null>(null);
+  const [importScreenTab, setImportScreenTab] = React.useState<'DOSSIERS' | 'HISTORIQUE'>('DOSSIERS');
+  const [histoPeriod, setHistoPeriod] = React.useState<'3M' | '6M' | '12M'>('6M');
 
   const [modalVisible, setModalVisible] = React.useState(false);
   const [supplierModalVisible, setSupplierModalVisible] = React.useState(false);
@@ -178,11 +200,24 @@ export function PurchasingImportScreen({ navigation }: any) {
 
   const handleNextStep = async () => {
     if (!dossier) return;
-    const steps = ['DA_VALIDEE', 'PROFORMA', 'LC_VIREMENT', 'EXPEDITION', 'CONNAISSEMENT', 'DEDOUANEMENT', 'ETA', 'RECEPTION'];
+    const steps = [
+      'DA_VALIDEE', 'PROFORMA', 'LC_VIREMENT', 'EXPEDITION',
+      'CONNAISSEMENT', 'DEDOUANEMENT', 'ETA',
+      'ARRIVEE_TAMATAVE', 'ARRIVEE_USINE',
+      'RECEPTION',
+    ];
     const currentIndex = steps.indexOf(dossier.current_step);
     if (currentIndex < steps.length - 1) {
       const nextStep = steps[currentIndex + 1];
       const updates: any = { current_step: nextStep };
+      // Enregistrer la date physique d'arrivée au port
+      if (nextStep === 'ARRIVEE_TAMATAVE') {
+        updates.date_arrivee_tamatave = new Date().toISOString().split('T')[0];
+      }
+      // Enregistrer la date physique d'arrivée à l'usine
+      if (nextStep === 'ARRIVEE_USINE') {
+        updates.date_arrivee_usine = new Date().toISOString().split('T')[0];
+      }
       if (nextStep === 'RECEPTION') updates.status = 'LIVRE';
 
       await daImportMutation.mutateAsync({ id: dossier.id, values: updates, type: 'UPDATE' });
@@ -204,6 +239,64 @@ export function PurchasingImportScreen({ navigation }: any) {
         article: dossier.article,
         supplier: dossier.supplier,
       });
+
+      // ─────────────────────────────────────────────────────────────────────
+      // 🔄 DA import → RECEPTION : créer automatiquement BE + lot EN_ATTENTE
+      // Le MAGA validera ensuite la réception physique depuis l'écran Réception MP.
+      // ─────────────────────────────────────────────────────────────────────
+      if (nextStep === 'RECEPTION' && supabase) {
+        try {
+          const beCode = await getNextCode('BE', 'bons_entree', 'code');
+          const today  = new Date().toISOString().split('T')[0];
+
+          const { data: beData, error: beErr } = await supabase
+            .from('bons_entree')
+            .insert({
+              code:           beCode,
+              supplier_id:    dossier.supplier_id,
+              article_id:     dossier.article_id,
+              reception_date: today,
+              status:         'EN_ATTENTE',
+              da_import_id:   dossier.id,
+              unit:           'kg',
+              notes:          `Créé automatiquement depuis DA import ${dossier.code}`,
+            })
+            .select('id, code')
+            .single();
+
+          if (beErr) throw beErr;
+
+          const lotCode = await getNextCode('L', 'lots', 'code');
+          const { error: lotErr } = await supabase
+            .from('lots')
+            .insert({
+              code:           lotCode,
+              bon_entree_id:  beData!.id,
+              article_id:     dossier.article_id,
+              supplier_id:    dossier.supplier_id,
+              qty_received:   dossier.qty_kg || 0,
+              qty_current:    dossier.qty_kg || 0,
+              unit:           'kg',
+              reception_date: today,
+              cqlib_status:   'EN_ATTENTE',
+            });
+
+          if (lotErr) throw lotErr;
+
+          // Notifier le MAGA
+          await notify.mutateAsync({
+            to_role:  'MAGA',
+            subject:  `Réception MP en attente — ${dossier.code}`,
+            message:  `DA import ${dossier.code} arrivée à l'usine. Bon d'entrée ${beCode} en attente de réception physique.`,
+            type:     'internal',
+            category: 'PURCHASING',
+            metadata: { category: 'PURCHASING', screen: 'ReceptionMP', da_import_id: dossier.id },
+          });
+        } catch (e: any) {
+          console.warn('[AutoBE-Import] Erreur création BE automatique:', e?.message || e);
+          // Non bloquant — la DA est déjà passée en RECEPTION
+        }
+      }
     }
   };
 
@@ -258,6 +351,52 @@ export function PurchasingImportScreen({ navigation }: any) {
     fetchLatestRates(); 
   }, []); // Empty dependency array - run only once on mount
 
+  // ─── Rappel magasinier J-3 avant ETA ──────────────────────────────────────
+  React.useEffect(() => {
+    if (!supabase || !profile?.id || dossiers.length === 0) return;
+    const today = new Date();
+    const in3days = new Date();
+    in3days.setDate(today.getDate() + 3);
+
+    const upcoming = dossiers.filter((d: any) => {
+      if (!d.eta_date || d.status === 'LIVRE' || d.status === 'ANNULE') return false;
+      const eta = new Date(d.eta_date);
+      return eta >= today && eta <= in3days;
+    });
+
+    if (upcoming.length === 0) return;
+
+    upcoming.forEach(async (d: any) => {
+      const eta = new Date(d.eta_date);
+      const diffDays = Math.ceil((eta.getTime() - today.getTime()) / (1000 * 86400));
+      const todayStr = today.toISOString().split('T')[0];
+      if (!supabase) return;
+      // Éviter doublon
+      const { data: existing } = await supabase
+        .from('notifications')
+        .select('id')
+        .eq('metadata->>da_import_id', d.id)
+        .eq('metadata->>notif_date', todayStr)
+        .eq('metadata->>notif_type', 'ETA_REMINDER')
+        .maybeSingle();
+      if (existing) return;
+      await supabase.from('notifications').insert({
+        role: 'MAGA',
+        title: `🚢 ETA dans ${diffDays} jour${diffDays > 1 ? 's' : ''} — ${d.code}`,
+        message: `Import ${d.code} — ${d.article?.name || 'article'} (${d.supplier?.name || 'fournisseur'}) — ETA prévisionnelle : ${eta.toLocaleDateString('fr-FR')}. Préparation réception à prévoir.`,
+        type: 'info',
+        metadata: {
+          screen: 'PurchasingImport',
+          da_import_id: d.id,
+          notif_date: todayStr,
+          notif_type: 'ETA_REMINDER',
+          category: 'PURCHASING',
+        },
+      });
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dossiers.length, profile?.id]);
+
   const handleAdd = async () => {
     const year = new Date().getFullYear();
     let newCode = `DA-IMP-${year}-PEND`;
@@ -271,6 +410,7 @@ export function PurchasingImportScreen({ navigation }: any) {
       code: newCode,
       status: 'EN_COURS',
       current_step: 'DA_VALIDEE',
+      container_type: '20_FT', // Valeur par défaut : conteneur 20 pieds
       request_date: new Date().toISOString().split('T')[0],
       documents: [] // Initialize documents array
     });
@@ -318,6 +458,7 @@ export function PurchasingImportScreen({ navigation }: any) {
       currency: formData.currency || 'USD',
       amount_currency: parseFloat(formData.amount_currency || '0'),
       amount_mga: formData.amount_mga || null,
+      lead_time_days: formData.lead_time_days ? parseInt(formData.lead_time_days, 10) : null,
       current_step: formData.current_step || 'DA_VALIDEE',
       status: formData.status || 'EN_COURS',
       eta_date: formData.eta_date || null,
@@ -466,6 +607,138 @@ export function PurchasingImportScreen({ navigation }: any) {
   return (
     <AnimatedPage>
       {isGeneratingPdf && <ExportOverlay visible={true} progress={pdfProgress} title="Génération du Dossier DA..." />}
+
+      {/* ─── Onglets ──────────────────────────────────────────────────────── */}
+      <View style={{ flexDirection: 'row', backgroundColor: '#FFF', borderBottomWidth: 1, borderBottomColor: '#E9ECEF', paddingHorizontal: 24 }}>
+        {(['DOSSIERS', 'HISTORIQUE'] as const).map(tab => (
+          <TouchableOpacity key={tab} onPress={() => setImportScreenTab(tab)}
+            style={{ paddingVertical: 14, paddingHorizontal: 18, borderBottomWidth: 2, borderBottomColor: importScreenTab === tab ? C.info : 'transparent' }}>
+            <Text style={{ fontSize: 12, fontWeight: '800', color: importScreenTab === tab ? C.info : '#ADB5BD' }}>{tab}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {importScreenTab === 'HISTORIQUE' ? (
+        /* ─── Onglet Historique & Analyse ────────────────────────────────── */
+        <ScrollView style={s.container} contentContainerStyle={s.content}>
+          <Text style={[s.title, { marginBottom: 4 }]}>Analyse Historique Import</Text>
+          <Text style={[s.subTitle, { marginBottom: 16 }]}>Vue par famille MP, fournisseur et période</Text>
+
+          {/* Filtre période */}
+          <View style={{ flexDirection: 'row', gap: 8, marginBottom: 20 }}>
+            {(['3M', '6M', '12M'] as const).map(p => (
+              <TouchableOpacity key={p} onPress={() => setHistoPeriod(p)}
+                style={{ paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, backgroundColor: histoPeriod === p ? C.info : '#F0F4F8', borderWidth: 1, borderColor: histoPeriod === p ? C.info : '#D1D9E0' }}>
+                <Text style={{ fontSize: 12, fontWeight: '700', color: histoPeriod === p ? '#FFF' : '#495057' }}>{p === '3M' ? '3 mois' : p === '6M' ? '6 mois' : '12 mois'}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {(() => {
+            const cutoff = new Date();
+            cutoff.setMonth(cutoff.getMonth() - (histoPeriod === '3M' ? 3 : histoPeriod === '6M' ? 6 : 12));
+            const filtered = dossiers.filter((d: any) => {
+              const date = d.reception_date || d.request_date || d.created_at;
+              return date ? new Date(date) >= cutoff : true;
+            });
+            const delivered = filtered.filter((d: any) => d.status === 'LIVRE' || d.status === 'RECEPTION');
+
+            // Vue par famille MP
+            const byFamily: Record<string, { count: number; qty: number; avgLead: number; leads: number[] }> = {};
+            filtered.forEach((d: any) => {
+              const family = d.article?.family || d.article?.article_type || 'Autre';
+              if (!byFamily[family]) byFamily[family] = { count: 0, qty: 0, avgLead: 0, leads: [] };
+              byFamily[family].count++;
+              byFamily[family].qty += parseFloat(d.qty_kg || '0');
+              if (d.lead_time_days) byFamily[family].leads.push(d.lead_time_days);
+            });
+            Object.values(byFamily).forEach(f => {
+              f.avgLead = f.leads.length ? Math.round(f.leads.reduce((a, b) => a + b, 0) / f.leads.length) : 0;
+            });
+
+            // Vue par fournisseur
+            const bySupplier: Record<string, { count: number; qty: number; ontime: number; late: number }> = {};
+            filtered.forEach((d: any) => {
+              const sup = d.supplier?.name || 'Inconnu';
+              if (!bySupplier[sup]) bySupplier[sup] = { count: 0, qty: 0, ontime: 0, late: 0 };
+              bySupplier[sup].count++;
+              bySupplier[sup].qty += parseFloat(d.qty_kg || '0');
+              if (d.status === 'RETARD') bySupplier[sup].late++;
+              else if (d.status === 'LIVRE' || d.status === 'RECEPTION') bySupplier[sup].ontime++;
+            });
+
+            return (
+              <View>
+                {/* KPIs résumé */}
+                <View style={[s.grid, isMobile && { flexDirection: 'column' }]}>
+                  <KpiCard label="DA sur la période" value={String(filtered.length)} sub={`dont ${delivered.length} livrées`} color={C.info} />
+                  <KpiCard label="Volume total" value={filtered.reduce((a: number, d: any) => a + parseFloat(d.qty_kg || '0'), 0).toLocaleString() + ' kg'} sub="toutes familles" />
+                  <KpiCard label="Taux retard" value={filtered.length ? Math.round((filtered.filter((d: any) => d.status === 'RETARD').length / filtered.length) * 100) + '%' : '—'} sub="DA en retard" color={C.err} />
+                </View>
+
+                <View style={{ height: 24 }} />
+
+                {/* Par famille MP */}
+                <Text style={{ fontSize: 13, fontWeight: '800', color: '#1A1A1A', marginBottom: 12 }}>PAR FAMILLE MATIÈRE PREMIÈRE</Text>
+                {Object.keys(byFamily).length === 0 ? (
+                  <Text style={{ color: '#ADB5BD', fontSize: 13, marginBottom: 24 }}>Aucune donnée sur cette période</Text>
+                ) : (
+                  <View style={{ marginBottom: 24 }}>
+                    {Object.entries(byFamily).sort((a, b) => b[1].qty - a[1].qty).map(([family, data]) => (
+                      <View key={family} style={{ backgroundColor: '#FFF', borderRadius: 10, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: '#E9ECEF', flexDirection: 'row', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                        <View style={{ flex: 2, minWidth: 100 }}>
+                          <Text style={{ fontSize: 14, fontWeight: '700', color: '#1A1A1A' }}>{family}</Text>
+                          <Text style={{ fontSize: 11, color: '#6C757D' }}>{data.count} dossier{data.count > 1 ? 's' : ''}</Text>
+                        </View>
+                        <View style={{ flex: 1, minWidth: 80 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>{data.qty.toLocaleString()} kg</Text>
+                          <Text style={{ fontSize: 10, color: '#ADB5BD' }}>volume total</Text>
+                        </View>
+                        {data.avgLead > 0 && (
+                          <View style={{ flex: 1, minWidth: 80 }}>
+                            <Text style={{ fontSize: 13, fontWeight: '700', color: C.info }}>{data.avgLead}j</Text>
+                            <Text style={{ fontSize: 10, color: '#ADB5BD' }}>délai moyen</Text>
+                          </View>
+                        )}
+                      </View>
+                    ))}
+                  </View>
+                )}
+
+                {/* Par fournisseur */}
+                <Text style={{ fontSize: 13, fontWeight: '800', color: '#1A1A1A', marginBottom: 12 }}>PAR FOURNISSEUR</Text>
+                {Object.keys(bySupplier).length === 0 ? (
+                  <Text style={{ color: '#ADB5BD', fontSize: 13 }}>Aucune donnée sur cette période</Text>
+                ) : (
+                  Object.entries(bySupplier).sort((a, b) => b[1].count - a[1].count).map(([sup, data]) => {
+                    const total = data.ontime + data.late;
+                    const tauxRespect = total > 0 ? Math.round((data.ontime / total) * 100) : null;
+                    return (
+                      <View key={sup} style={{ backgroundColor: '#FFF', borderRadius: 10, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: '#E9ECEF', flexDirection: 'row', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                        <View style={{ flex: 2, minWidth: 120 }}>
+                          <Text style={{ fontSize: 14, fontWeight: '700', color: '#1A1A1A' }}>{sup}</Text>
+                          <Text style={{ fontSize: 11, color: '#6C757D' }}>{data.count} DA · {data.qty.toLocaleString()} kg</Text>
+                        </View>
+                        {tauxRespect !== null && (
+                          <View style={{ alignItems: 'center' }}>
+                            <Text style={{ fontSize: 16, fontWeight: '900', color: tauxRespect >= 80 ? C.ok : tauxRespect >= 60 ? C.gold : C.err }}>{tauxRespect}%</Text>
+                            <Text style={{ fontSize: 10, color: '#ADB5BD' }}>taux respect délai</Text>
+                          </View>
+                        )}
+                        {data.late > 0 && (
+                          <View style={{ backgroundColor: C.err + '10', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
+                            <Text style={{ fontSize: 11, fontWeight: '700', color: C.err }}>{data.late} retard{data.late > 1 ? 's' : ''}</Text>
+                          </View>
+                        )}
+                      </View>
+                    );
+                  })
+                )}
+              </View>
+            );
+          })()}
+        </ScrollView>
+      ) : (
       <ScrollView style={s.container} contentContainerStyle={s.content}>
         {/* Header */}
         <View style={[s.headerRow, isMobile && { flexDirection: 'column', alignItems: 'flex-start', gap: 16 }]}>
@@ -484,9 +757,17 @@ export function PurchasingImportScreen({ navigation }: any) {
         </View>
 
         <View style={[s.grid, isMobile && { flexDirection: 'column' }]}>
-          <KpiCard label={t('active_da_import')} value={String(dossiers.filter(d => d.status === 'EN_COURS').length)} sub={t('loading')} color={C.info} />
+          <KpiCard label={t('active_da_import')} value={String(dossiers.filter(d => d.status === 'EN_COURS').length)} sub={t('in_progress')} color={C.info} />
           <KpiCard label={t('eta_alerts')} value={String(dossiers.filter(d => d.status === 'RETARD').length)} sub={t('immediate_action')} color={C.err} />
-          <KpiCard label={t('avg_lead_time')} value="92j" sub="Port-to-Factory" />
+          <KpiCard label={t('avg_lead_time')} value={(() => {
+            const completed = dossiers.filter((d: any) => (d.status === 'LIVRE' || d.status === 'CLOS') && d.created_at && d.eta_date);
+            if (!completed.length) return '—';
+            const avg = completed.reduce((acc: number, d: any) => {
+              const diff = (new Date(d.eta_date).getTime() - new Date(d.created_at).getTime()) / 86400000;
+              return acc + Math.abs(diff);
+            }, 0) / completed.length;
+            return Math.round(avg) + 'j';
+          })()} sub="Port-to-Factory" />
         </View>
 
         <View style={{ height: 24 }} />
@@ -509,7 +790,7 @@ export function PurchasingImportScreen({ navigation }: any) {
                   </View>
                   <View style={{ alignItems: 'flex-end', gap: 6 }}>
                     <View style={[s.statusBadge, { backgroundColor: d.status === 'RETARD' ? C.err + '20' : '#F8F9FA' }]}>
-                      <Text style={[s.statusText, { color: d.status === 'RETARD' ? C.err : '#1A1A1A' }]}>{d.status}</Text>
+                      <Text style={[s.statusText, { color: d.status === 'RETARD' ? C.err : '#1A1A1A' }]}>{d.status?.replace(/_/g, ' ')}</Text>
                     </View>
                     <Text style={[s.dAmount, selId === d.id && { color: '#FFF' }]}>{d.amount_currency} {d.currency}</Text>
                   </View>
@@ -566,6 +847,7 @@ export function PurchasingImportScreen({ navigation }: any) {
                             currency: dossierData.currency,
                             amount_currency: String(dossierData.amount_currency || ''),
                             amount_mga: dossierData.amount_mga,
+                            lead_time_days: dossierData.lead_time_days != null ? String(dossierData.lead_time_days) : '',
                             current_step: dossierData.current_step,
                             status: dossierData.status,
                             eta_date: dossierData.eta_date,
@@ -585,7 +867,9 @@ export function PurchasingImportScreen({ navigation }: any) {
                             'Confirmer',
                             `Supprimer le dossier ${dossier.code} ?`,
                             () => daImportMutation.mutate({ id: dossier.id, type: 'DELETE' })
-                          );
+                          ,
+    'danger'
+  );
                         }}
                       />
                     )}
@@ -644,8 +928,78 @@ export function PurchasingImportScreen({ navigation }: any) {
                     <View style={s.infoBox}><Text style={s.infoLabel}>{t('qty_received')}</Text><Text style={s.infoValue}>{dossier.qty_container} CT · {dossier.qty_kg} Kg</Text></View>
                     <View style={s.infoBox}><Text style={s.infoLabel}>{t('eta_planned')}</Text><Text style={s.infoValue}>{dossier.eta_date ? new Date(dossier.eta_date).toLocaleDateString() : '—'}</Text></View>
                     <View style={s.infoBox}><Text style={s.infoLabel}>{t('incoterm')}</Text><Text style={s.infoValue}>FOB / CFR</Text></View>
-                    <View style={s.infoBox}><Text style={s.infoLabel}>{t('leadtime')}</Text><Text style={s.infoValue}>{dossier.lead_time_days} jours</Text></View>
+                    <View style={s.infoBox}><Text style={s.infoLabel}>{t('leadtime')}</Text><Text style={s.infoValue}>{dossier.lead_time_days != null ? `${dossier.lead_time_days} jours` : '—'}</Text></View>
+                    {/* Jalons physiques Tamatave / Usine */}
+                    {dossier.date_arrivee_tamatave ? (
+                      <View style={s.infoBox}><Text style={s.infoLabel}>Arrivée Tamatave</Text><Text style={[s.infoValue, { color: C.ok }]}>{new Date(dossier.date_arrivee_tamatave).toLocaleDateString()}</Text></View>
+                    ) : null}
+                    {dossier.date_arrivee_usine ? (
+                      <View style={s.infoBox}><Text style={s.infoLabel}>Arrivée Usine</Text><Text style={[s.infoValue, { color: C.ok }]}>{new Date(dossier.date_arrivee_usine).toLocaleDateString()}</Text></View>
+                    ) : null}
                   </View>
+
+                  {/* ─── Suivi réceptions partielles ─────────────────────── */}
+                  {(() => {
+                    const partials: Array<{ date: string; qty_kg: number; notes?: string }> =
+                      Array.isArray(dossier.partial_receptions) ? dossier.partial_receptions : [];
+                    const totalReceived = partials.reduce((s: number, p: any) => s + (p.qty_kg || 0), 0);
+                    const qtyTotal = parseFloat(String(dossier.qty_kg || '0'));
+                    const reliquat = Math.max(0, qtyTotal - totalReceived);
+                    if (qtyTotal <= 0) return null;
+                    return (
+                      <View style={{ marginTop: 16, backgroundColor: '#F8F9FA', borderRadius: 10, padding: 14, borderWidth: 1, borderColor: '#E9ECEF' }}>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                          <Text style={{ fontSize: 11, fontWeight: '800', color: '#ADB5BD' }}>LIVRAISONS PARTIELLES</Text>
+                          <View style={{ flexDirection: 'row', gap: 6 }}>
+                            <View style={{ backgroundColor: C.ok + '15', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
+                              <Text style={{ fontSize: 11, fontWeight: '700', color: C.ok }}>Reçu : {totalReceived.toLocaleString()} kg</Text>
+                            </View>
+                            {reliquat > 0 && (
+                              <View style={{ backgroundColor: C.gold + '15', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
+                                <Text style={{ fontSize: 11, fontWeight: '700', color: C.gold }}>Reliquat : {reliquat.toLocaleString()} kg</Text>
+                              </View>
+                            )}
+                          </View>
+                        </View>
+                        {/* Barre de progression */}
+                        <View style={{ height: 6, backgroundColor: '#E9ECEF', borderRadius: 3, marginBottom: 10 }}>
+                          <View style={{ height: 6, width: `${Math.min(100, qtyTotal > 0 ? (totalReceived / qtyTotal) * 100 : 0)}%` as any, backgroundColor: reliquat === 0 ? C.ok : C.info, borderRadius: 3 }} />
+                        </View>
+                        {partials.length === 0 ? (
+                          <Text style={{ fontSize: 12, color: '#ADB5BD', textAlign: 'center', paddingVertical: 6 }}>Aucune livraison partielle enregistrée</Text>
+                        ) : (
+                          partials.map((p: any, idx: number) => (
+                            <View key={idx} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6, borderBottomWidth: idx < partials.length - 1 ? 1 : 0, borderBottomColor: '#E9ECEF' }}>
+                              <Text style={{ fontSize: 12, color: '#495057' }}>Livraison {idx + 1} · {p.date ? new Date(p.date).toLocaleDateString() : '—'}</Text>
+                              <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+                                <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>{p.qty_kg?.toLocaleString()} kg</Text>
+                                {p.notes ? <Text style={{ fontSize: 11, color: '#6C757D' }}>{p.notes}</Text> : null}
+                              </View>
+                            </View>
+                          ))
+                        )}
+                        {canManage && dossier.status !== 'LIVRE' && (
+                          <TouchableOpacity
+                            onPress={() => {
+                              const dateStr = new Date().toISOString().split('T')[0];
+                              const qtyStr = window.prompt ? window.prompt('Quantité reçue (kg) :') : '';
+                              if (!qtyStr) return;
+                              const newPartial = { date: dateStr, qty_kg: parseFloat(qtyStr) || 0, notes: '' };
+                              const updatedPartials = [...partials, newPartial];
+                              if (supabase) {
+                                supabase.from('da_import').update({ partial_receptions: updatedPartials }).eq('id', dossier.id)
+                                  .then(() => queryClient.invalidateQueries({ queryKey: ['da_import'] }));
+                              }
+                            }}
+                            style={{ marginTop: 10, flexDirection: 'row', alignItems: 'center', gap: 6, justifyContent: 'center', padding: 8, borderRadius: 6, borderWidth: 1, borderColor: C.info, borderStyle: 'dashed' }}
+                          >
+                            <MaterialCommunityIcons name="plus" size={14} color={C.info} />
+                            <Text style={{ fontSize: 12, color: C.info, fontWeight: '700' }}>Enregistrer une livraison partielle</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    );
+                  })()}
 
                   <View style={{ height: 32 }} />
 
@@ -723,6 +1077,7 @@ export function PurchasingImportScreen({ navigation }: any) {
           )}
         </View>
       </ScrollView>
+      )} {/* end importScreenTab === 'DOSSIERS' */}
 
       <FormModal
         visible={modalVisible}
@@ -806,6 +1161,7 @@ export function PurchasingImportScreen({ navigation }: any) {
           editable={false} // Ce champ est calculé, donc non éditable
           style={{ backgroundColor: '#F8F9FA' }} // Style pour indiquer qu'il est non éditable
         />
+        <FormInput label="Délai de livraison (jours)" value={String(formData.lead_time_days || '')} onChangeText={val => setFormData({ ...formData, lead_time_days: val })} keyboardType="numeric" placeholder="ex: 45" />
         <FormInput label={t('incoterm')} value={formData.incoterm || ''} onChangeText={val => setFormData({ ...formData, incoterm: val })} placeholder="ex: FOB, CFR" />
         <FormInput label={t('notes_obs')} value={formData.notes || ''} onChangeText={val => setFormData({ ...formData, notes: val })} />
       </FormModal>

@@ -7,6 +7,7 @@ import { useTranslation } from '../lib/i18n';
 import { supabase, getNextCode } from '../lib/supabase';
 import { generatePdf, getPdfTemplate } from '../lib/pdf';
 import { SupplierCreateModal } from '../components/SupplierCreateModal';
+import { useQueryClient } from '@tanstack/react-query';
 
 const STEP_MAP: Record<string, number> = { 'SAISIE': 0, 'VALIDATION': 1, 'COMMANDE': 2, 'RECEPTION': 3 };
 
@@ -15,6 +16,7 @@ export function PurchasingLocalScreen() {
   const isMobile = width < 992;
   const { t } = useTranslation();
   const LOCAL_STEPS = [t('local_step_entry'), t('local_step_valid'), t('local_step_po'), t('local_step_rec')];
+  const queryClient = useQueryClient();
 
   const [page, setPage] = React.useState(0);
   const limit = 20;
@@ -26,7 +28,7 @@ export function PurchasingLocalScreen() {
   const { data: articles = [] } = useArticles(0, 500, 'MP');
   const { data: suppliers = [] } = useSuppliers(0, 100);
   const [selId, setSelId] = React.useState<string | null>(null);
-  const [activeTab, setActiveTab] = React.useState<'da' | 'reception_mp'>('da');
+  const [activeTab, setActiveTab] = React.useState<'da' | 'reception_mp' | 'dashboard'>('da');
   const [isGeneratingPdf, setIsGeneratingPdf] = React.useState(false);
 
   const [modalVisible, setModalVisible] = React.useState(false);
@@ -44,6 +46,47 @@ export function PurchasingLocalScreen() {
 
   const [supplierModalVisible, setSupplierModalVisible] = React.useState(false);
 
+  // ─── Rappel magasinier : livraisons prévues dans les 3 prochains jours ──────
+  React.useEffect(() => {
+    if (!supabase || !profile?.id) return;
+    const today = new Date();
+    const in3days = new Date();
+    in3days.setDate(today.getDate() + 3);
+
+    const upcoming = dossiers.filter((d: any) => {
+      if (!d.expected_delivery_date || d.status === 'RECEPTION' || d.status === 'ANNULE') return false;
+      const delivDate = new Date(d.expected_delivery_date);
+      return delivDate >= today && delivDate <= in3days;
+    });
+
+    if (upcoming.length === 0) return;
+
+    upcoming.forEach(async (d: any) => {
+      const delivDate = new Date(d.expected_delivery_date);
+      const diffDays = Math.ceil((delivDate.getTime() - today.getTime()) / (1000 * 86400));
+      const todayStr = today.toISOString().split('T')[0];
+
+      // Éviter doublon
+      if (!supabase) return;
+      const { data: existing } = await supabase
+        .from('notifications')
+        .select('id')
+        .eq('metadata->>da_id', d.id)
+        .eq('metadata->>notif_date', todayStr)
+        .maybeSingle();
+      if (existing) return;
+
+      await supabase.from('notifications').insert({
+        role: 'MAGA',
+        title: `📦 Livraison prévue dans ${diffDays} jour${diffDays > 1 ? 's' : ''}`,
+        message: `DA locale ${d.code} — ${d.article?.name || 'article'} (${d.supplier?.name || 'fournisseur'}) — date prévue : ${delivDate.toLocaleDateString('fr-FR')}`,
+        type: 'info',
+        metadata: { screen: 'PurchasingLocalScreen', da_id: d.id, notif_date: todayStr, category: 'PURCHASING' },
+      });
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dossiers.length, profile?.id]);
+
   if (loading) {
     return (
       <View style={[s.container, { justifyContent: 'center', alignItems: 'center' }]}>
@@ -57,7 +100,7 @@ export function PurchasingLocalScreen() {
   const canValidate = role === 'DPI' || role === 'ADMIN';
   const canReceive = role === 'MAGA' || role === 'ADMIN';
 
-  const handleNextStep = () => {
+  const handleNextStep = async () => {
     if (!dossier) return;
     const steps = ['SAISIE', 'VALIDATION', 'COMMANDE', 'RECEPTION'];
     const currentIndex = steps.indexOf(dossier.current_step);
@@ -66,6 +109,64 @@ export function PurchasingLocalScreen() {
       const updates: any = { current_step: nextStep };
       if (nextStep === 'RECEPTION') updates.status = 'LIVRE';
       mutation.mutate({ id: dossier.id, values: updates, type: 'UPDATE' });
+
+      // ───────────────────────────────────────────────────────────────────────
+      // 🔄 DA locale → RECEPTION : créer automatiquement BE + lot EN_ATTENTE
+      // Le MAGA validera ensuite la réception physique depuis l'écran Réception MP.
+      // ───────────────────────────────────────────────────────────────────────
+      if (nextStep === 'RECEPTION' && supabase) {
+        try {
+          const beCode = await getNextCode('BE', 'bons_entree', 'code');
+          const today  = new Date().toISOString().split('T')[0];
+
+          const { data: beData, error: beErr } = await supabase
+            .from('bons_entree')
+            .insert({
+              code:         beCode,
+              supplier_id:  dossier.supplier_id,
+              article_id:   dossier.article_id,
+              reception_date: today,
+              status:       'EN_ATTENTE',
+              da_local_id:  dossier.id,
+              unit:         dossier.unit || 'kg',
+              notes:        `Créé automatiquement depuis DA locale ${dossier.code}`,
+            })
+            .select('id, code')
+            .single();
+
+          if (beErr) throw beErr;
+
+          const lotCode = await getNextCode('L', 'lots', 'code');
+          const { error: lotErr } = await supabase
+            .from('lots')
+            .insert({
+              code:          lotCode,
+              bon_entree_id: beData!.id,
+              article_id:    dossier.article_id,
+              supplier_id:   dossier.supplier_id,
+              qty_received:  dossier.qty_requested || 0,
+              qty_current:   dossier.qty_requested || 0,
+              unit:          dossier.unit || 'kg',
+              reception_date: today,
+              cqlib_status:  'EN_ATTENTE',
+            });
+
+          if (lotErr) throw lotErr;
+
+          // Notifier le MAGA
+          notify.mutate({
+            to_role:  'MAGA',
+            subject:  `Réception MP en attente — ${dossier.code}`,
+            message:  `DA locale ${dossier.code} validée et livrée. Bon d'entrée ${beCode} en attente de réception physique.`,
+            type:     'internal',
+            category: 'PURCHASING',
+            metadata: { category: 'PURCHASING', screen: 'ReceptionMP', da_local_id: dossier.id },
+          });
+        } catch (e: any) {
+          console.warn('[AutoBE-Local] Erreur création BE automatique:', e?.message || e);
+          // Ne pas bloquer la progression de la DA — l'erreur est loguée mais non bloquante
+        }
+      }
     }
   };
 
@@ -187,7 +288,7 @@ export function PurchasingLocalScreen() {
         </View>
 
         {/* ── Onglets ─────────────────────────────────────────────────── */}
-        <View style={s.tabRow}>
+        <View style={[s.tabRow, { flexWrap: 'wrap' }]}>
           <TouchableOpacity
             style={[s.tab, activeTab === 'da' && s.tabActive]}
             onPress={() => { setActiveTab('da'); setSelId(null); }}
@@ -202,14 +303,25 @@ export function PurchasingLocalScreen() {
             <MaterialCommunityIcons name="package-variant-closed" size={16} color={activeTab === 'reception_mp' ? '#FFF' : '#6C757D'} />
             <Text style={[s.tabLabel, activeTab === 'reception_mp' && s.tabLabelActive]}>Réception MP</Text>
           </TouchableOpacity>
+          <TouchableOpacity
+            style={[s.tab, activeTab === 'dashboard' && s.tabActive]}
+            onPress={() => { setActiveTab('dashboard'); setSelId(null); }}
+          >
+            <MaterialCommunityIcons name="chart-bar" size={16} color={activeTab === 'dashboard' ? '#FFF' : '#6C757D'} />
+            <Text style={[s.tabLabel, activeTab === 'dashboard' && s.tabLabelActive]}>Dashboard</Text>
+          </TouchableOpacity>
         </View>
 
         {activeTab === 'da' ? (
           <>
         <View style={[s.grid, isMobile && { flexDirection: 'column' }]}>
-          <KpiCard label={t('to_validate_dpi')} value={String(dossiers.filter(d => d.current_step === 'VALIDATION').length)} sub={t('loading')} color={C.gold} />
-          <KpiCard label={t('bc_in_progress')} value={String(dossiers.filter(d => d.current_step === 'COMMANDE').length)} sub={t('loading')} color={C.info} />
-          <KpiCard label={t('deliveries_month')} value="24" sub="Site Antananarivo" />
+          <KpiCard label={t('to_validate_dpi')} value={String(dossiers.filter(d => d.current_step === 'VALIDATION').length)} sub={t('awaiting_dpi_approval')} color={C.gold} />
+          <KpiCard label={t('bc_in_progress')} value={String(dossiers.filter(d => d.current_step === 'COMMANDE').length)} sub={t('orders_sent_to_supplier')} color={C.info} />
+          <KpiCard label={t('deliveries_month')} value={String(dossiers.filter((d: any) => {
+            const now = new Date();
+            const date = new Date(d.expected_delivery_date || d.updated_at || '');
+            return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear() && d.status !== 'ANNULE';
+          }).length)} sub="Site Antananarivo" />
         </View>
 
         <View style={{ height: 24 }} />
@@ -231,7 +343,7 @@ export function PurchasingLocalScreen() {
                   </View>
                   <View style={{ alignItems: 'flex-end', gap: 6 }}>
                     <View style={[s.statusBadge, { backgroundColor: d.current_step === 'VALIDATION' ? C.gold + '20' : '#F8F9FA' }]}>
-                      <Text style={[s.statusText, { color: d.current_step === 'VALIDATION' ? C.gold : '#1A1A1A' }]}>{d.current_step}</Text>
+                      <Text style={[s.statusText, { color: d.current_step === 'VALIDATION' ? C.gold : '#1A1A1A' }]}>{d.current_step?.replace(/_/g, ' ')}</Text>
                     </View>
                     <Text style={[s.dAmount, selId === d.id && { color: '#FFF' }]}>{d.amount_mga.toLocaleString()} Ar</Text>
                     {/* Bouton imprimer DA */}
@@ -303,7 +415,9 @@ export function PurchasingLocalScreen() {
                             'Confirmer',
                             `Supprimer la demande ${dossier.code} ?`,
                             () => mutation.mutate({ id: dossier.id, type: 'DELETE' })
-                          );
+                          ,
+    'danger'
+  );
                         }}
                       />
                     )}
@@ -334,7 +448,7 @@ export function PurchasingLocalScreen() {
                     <View style={s.infoBox}><Text style={s.infoLabel}>{t('qty_ordered')}</Text><Text style={s.infoValue}>{dossier.qty_requested} {dossier.unit}</Text></View>
                     <View style={s.infoBox}><Text style={s.infoLabel}>{t('total_amount')}</Text><Text style={s.infoValue}>{dossier.amount_mga.toLocaleString()} Ar</Text></View>
                     <View style={s.infoBox}><Text style={s.infoLabel}>{t('suppliers')}</Text><Text style={s.infoValue}>{dossier.supplier?.name}</Text></View>
-                    <View style={s.infoBox}><Text style={s.infoLabel}>{t('file_status')}</Text><Text style={s.infoValue}>{dossier.status}</Text></View>
+                    <View style={s.infoBox}><Text style={s.infoLabel}>{t('file_status')}</Text><Text style={s.infoValue}>{dossier.status?.replace(/_/g, ' ')}</Text></View>
                   </View>
 
                   {/* Deliveries list if any */}
@@ -382,9 +496,12 @@ export function PurchasingLocalScreen() {
           )}
         </View>
           </>
-        ) : (
+        ) : activeTab === 'reception_mp' ? (
           /* ── Onglet Réception MP ──────────────────────────────────── */
           <ReceptionMPTab profile={profile} articles={articles} suppliers={suppliers} />
+        ) : (
+          /* ── Onglet Dashboard ─────────────────────────────────────── */
+          <DashboardLocalTab dossiers={dossiers} isMobile={isMobile} />
         )}
       </ScrollView>
 
@@ -477,6 +594,142 @@ export function PurchasingLocalScreen() {
         )}
       </FormModal>
     </AnimatedPage>
+  );
+}
+
+// ─── Composant Dashboard Achat Local ─────────────────────────────────────────
+function DashboardLocalTab({ dossiers, isMobile }: { dossiers: any[]; isMobile: boolean }) {
+  // Vue par section (scope/article family)
+  const bySectionMap: Record<string, { count: number; pending: number; received: number; late: number }> = {};
+  dossiers.forEach((d: any) => {
+    const section = d.section || d.article?.family || 'Sans section';
+    if (!bySectionMap[section]) bySectionMap[section] = { count: 0, pending: 0, received: 0, late: 0 };
+    bySectionMap[section].count++;
+    if (d.current_step === 'RECEPTION') bySectionMap[section].received++;
+    else if (d.status === 'ANNULE') { /* skip */ }
+    else bySectionMap[section].pending++;
+    if (d.status === 'RETARD') bySectionMap[section].late++;
+  });
+
+  // Taux de respect délai par fournisseur
+  const supplierKpi: Record<string, { name: string; total: number; ontime: number; late: number }> = {};
+  dossiers.forEach((d: any) => {
+    if (!d.supplier_id || !d.supplier) return;
+    const id = d.supplier_id;
+    if (!supplierKpi[id]) supplierKpi[id] = { name: d.supplier?.name || id, total: 0, ontime: 0, late: 0 };
+    supplierKpi[id].total++;
+    if (d.current_step === 'RECEPTION') {
+      if (d.expected_delivery_date && d.actual_delivery_date) {
+        const expected = new Date(d.expected_delivery_date);
+        const actual = new Date(d.actual_delivery_date);
+        if (actual <= expected) supplierKpi[id].ontime++;
+        else supplierKpi[id].late++;
+      } else {
+        supplierKpi[id].ontime++;
+      }
+    } else if (d.status === 'RETARD') {
+      supplierKpi[id].late++;
+    }
+  });
+
+  // Livraisons à venir J+7
+  const today = new Date();
+  const in7days = new Date();
+  in7days.setDate(today.getDate() + 7);
+  const upcoming = dossiers.filter((d: any) => {
+    if (!d.expected_delivery_date || d.current_step === 'RECEPTION' || d.status === 'ANNULE') return false;
+    const delivDate = new Date(d.expected_delivery_date);
+    return delivDate >= today && delivDate <= in7days;
+  });
+
+  return (
+    <View style={{ paddingTop: 8 }}>
+      {/* KPIs synthèse */}
+      <View style={[s.grid, isMobile && { flexDirection: 'column' }]}>
+        <KpiCard label="DA actives" value={String(dossiers.filter((d: any) => d.status !== 'ANNULE' && d.current_step !== 'RECEPTION').length)} sub="en cours de traitement" color={C.info} />
+        <KpiCard label="Livraisons J+7" value={String(upcoming.length)} sub="à préparer" color={upcoming.length > 0 ? C.gold : C.ok} />
+        <KpiCard label="En retard" value={String(dossiers.filter((d: any) => d.status === 'RETARD').length)} sub="DA locales retardées" color={C.err} />
+      </View>
+
+      <View style={{ height: 20 }} />
+
+      {/* Livraisons imminentes */}
+      {upcoming.length > 0 && (
+        <View style={{ backgroundColor: '#FFFBEB', borderRadius: 10, padding: 14, marginBottom: 20, borderWidth: 1, borderColor: '#FDE68A' }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+            <MaterialCommunityIcons name="truck-delivery-outline" size={18} color={C.gold} />
+            <Text style={{ fontSize: 13, fontWeight: '800', color: C.gold }}>LIVRAISONS ATTENDUES (7 prochains jours)</Text>
+          </View>
+          {upcoming.map((d: any) => (
+            <View key={d.id} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#FDE68A', flexWrap: 'wrap', gap: 6 }}>
+              <View>
+                <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A1A1A' }}>{d.code} — {d.article?.name || '—'}</Text>
+                <Text style={{ fontSize: 11, color: '#6C757D' }}>{d.supplier?.name || '—'}</Text>
+              </View>
+              <View style={{ backgroundColor: C.gold + '20', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6, alignSelf: 'flex-start' }}>
+                <Text style={{ fontSize: 12, fontWeight: '700', color: C.gold }}>
+                  {d.expected_delivery_date ? new Date(d.expected_delivery_date).toLocaleDateString('fr-FR') : '—'}
+                </Text>
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
+
+      {/* Par section */}
+      <Text style={{ fontSize: 13, fontWeight: '800', color: '#1A1A1A', marginBottom: 12 }}>PAR SECTION / FAMILLE</Text>
+      {Object.keys(bySectionMap).length === 0 ? (
+        <Text style={{ color: '#ADB5BD', fontSize: 13, marginBottom: 24 }}>Aucune DA enregistrée</Text>
+      ) : (
+        Object.entries(bySectionMap).sort((a, b) => b[1].count - a[1].count).map(([section, data]) => (
+          <View key={section} style={{ backgroundColor: '#FFF', borderRadius: 10, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: '#E9ECEF' }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+              <View>
+                <Text style={{ fontSize: 14, fontWeight: '700', color: '#1A1A1A' }}>{section}</Text>
+                <Text style={{ fontSize: 11, color: '#6C757D' }}>{data.count} DA · {data.received} livrée{data.received > 1 ? 's' : ''} · {data.pending} en attente</Text>
+              </View>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                {data.late > 0 && <View style={{ backgroundColor: C.err + '15', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}><Text style={{ fontSize: 11, fontWeight: '700', color: C.err }}>{data.late} retard{data.late > 1 ? 's' : ''}</Text></View>}
+                <View style={{ backgroundColor: C.info + '15', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}><Text style={{ fontSize: 11, fontWeight: '700', color: C.info }}>{data.count} total</Text></View>
+              </View>
+            </View>
+          </View>
+        ))
+      )}
+
+      <View style={{ height: 16 }} />
+
+      {/* Taux respect délai fournisseur */}
+      <Text style={{ fontSize: 13, fontWeight: '800', color: '#1A1A1A', marginBottom: 12 }}>TAUX RESPECT DÉLAI PAR FOURNISSEUR</Text>
+      {Object.keys(supplierKpi).length === 0 ? (
+        <Text style={{ color: '#ADB5BD', fontSize: 13 }}>Aucune donnée disponible</Text>
+      ) : (
+        Object.values(supplierKpi).sort((a, b) => b.total - a.total).map(sup => {
+          const evalued = sup.ontime + sup.late;
+          const tauxRespect = evalued > 0 ? Math.round((sup.ontime / evalued) * 100) : null;
+          const kpiColor = tauxRespect === null ? '#ADB5BD' : tauxRespect >= 80 ? C.ok : tauxRespect >= 60 ? C.gold : C.err;
+          return (
+            <View key={sup.name} style={{ backgroundColor: '#FFF', borderRadius: 10, padding: 14, marginBottom: 10, borderWidth: 1, borderColor: '#E9ECEF', flexDirection: 'row', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <View style={{ flex: 2, minWidth: 120 }}>
+                <Text style={{ fontSize: 14, fontWeight: '700', color: '#1A1A1A' }}>{sup.name}</Text>
+                <Text style={{ fontSize: 11, color: '#6C757D' }}>{sup.total} DA · {sup.ontime} à temps · {sup.late} retard</Text>
+              </View>
+              <View style={{ alignItems: 'center', minWidth: 60 }}>
+                <Text style={{ fontSize: 20, fontWeight: '900', color: kpiColor }}>{tauxRespect !== null ? tauxRespect + '%' : '—'}</Text>
+                <Text style={{ fontSize: 10, color: '#ADB5BD' }}>taux délai</Text>
+              </View>
+              {tauxRespect !== null && (
+                <View style={{ flex: 1, minWidth: 80 }}>
+                  <View style={{ height: 6, backgroundColor: '#E9ECEF', borderRadius: 3 }}>
+                    <View style={{ height: 6, width: `${tauxRespect}%` as any, backgroundColor: kpiColor, borderRadius: 3 }} />
+                  </View>
+                </View>
+              )}
+            </View>
+          );
+        })
+      )}
+    </View>
   );
 }
 
@@ -632,7 +885,9 @@ function ReceptionMPTab({ profile, articles, suppliers }: { profile: any; articl
                       'Confirmation',
                       `Supprimer le lot ${lot.code || lot.id?.substring(0, 8).toUpperCase()} ?`,
                       () => lotsMutation.mutate({ id: lot.id, type: 'DELETE' })
-                    );
+                    ,
+    'danger'
+  );
                   }}
                   style={s.iconButton}
                 >
