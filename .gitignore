@@ -11,3 +11,4 @@ yarn-error.log*
 .vercel
 scratch/
 .temp/
+"erp-native.zip" 
