@@ -3410,9 +3410,8 @@ export function RhScreen() {
                             setAlert(`${errCount} suppression(s) ont échoué. Vérifiez les contraintes FK.`);
                           }
                         },
-                      ,
-    'danger'
-  );
+                        'danger',
+                      );
                     }}
                     style={{
                       backgroundColor: '#DC2626',
